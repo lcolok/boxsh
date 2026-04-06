@@ -3,3 +3,4 @@
  */
 
 import './session.test.mjs';
+import './default-path.test.mjs';
