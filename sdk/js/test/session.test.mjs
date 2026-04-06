@@ -39,16 +39,14 @@ describe('BoxshClient — overlay sandbox', () => {
         const dir      = path.join(tmpDir, id);
         const upperDir = path.join(dir, 'upper');
         const workDir  = path.join(dir, 'work');
-        const mntDir   = path.join(dir, 'mnt');
         fs.mkdirSync(upperDir, { recursive: true });
         fs.mkdirSync(workDir,  { recursive: true });
-        fs.mkdirSync(mntDir,   { recursive: true });
 
         const client = new BoxshClient({
             boxshPath: BOXSH,
             workers:   1,
             sandbox:   true,
-            overlay:   { lower: baseDir, upper: upperDir, work: workDir, dst: mntDir },
+            overlay:   { lower: baseDir, upper: upperDir, work: workDir, dst: '/workspace' },
         });
 
         return { client, upperDir };
