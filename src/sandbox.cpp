@@ -287,6 +287,26 @@ SandboxResult sandbox_apply(const SandboxConfig &cfg) {
         }
         if (!apply_overlay_mounts(cfg.overlay_mounts, "", res.error))
             return res;
+        // If the process CWD falls inside an overlay mount point, refresh the
+        // CWD dentry so that relative paths go through the overlay and not the
+        // underlying filesystem.  This is needed because unshare+mount updates
+        // the mount table but the kernel's stored CWD (dentry,vfsmount) pair
+        // still points at the lower layer until the next absolute path lookup.
+        if (!cfg.overlay_mounts.empty()) {
+            char *cwd_buf = getcwd(nullptr, 0);
+            if (cwd_buf) {
+                std::string cwd(cwd_buf);
+                free(cwd_buf);
+                for (const auto &ov : cfg.overlay_mounts) {
+                    if (cwd == ov.container_path ||
+                        cwd.substr(0, ov.container_path.size() + 1) ==
+                            ov.container_path + "/") {
+                        chdir(cwd.c_str());
+                        break;
+                    }
+                }
+            }
+        }
         for (const auto &pm : cfg.proc_mounts) {
             if (!mount_proc(pm.container_path, res.error))
                 return res;
