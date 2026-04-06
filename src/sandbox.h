@@ -51,16 +51,9 @@ struct SandboxConfig {
     bool new_pid_ns   = false; // CLONE_NEWPID (requires extra fork)
     bool new_net_ns   = false; // CLONE_NEWNET
 
-    // New root filesystem (empty = keep current root).
-    // If set, boxsh will mount a tmpfs here, apply bind mounts,
-    // then pivot_root into it.
-    std::string new_rootfs;
-
-    // Bind mounts to apply inside the sandbox.
+    // Bind mounts to apply inside the sandbox (in addition to the automatic
+    // read-only system mounts that sandbox_apply() always sets up).
     std::vector<BindMount> bind_mounts;
-
-    // If true, remount / as read-only after pivot_root.
-    bool readonly_root = false;
 
     // Overlay mounts: each entry is mounted as overlayfs.  upper/work dirs
     // are managed by the caller and must exist before sandbox_apply().

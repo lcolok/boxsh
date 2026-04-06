@@ -6,6 +6,7 @@
  */
 
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
 import { spawnSync, spawn } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import path from 'node:path';
@@ -16,6 +17,28 @@ const __dir = path.dirname(fileURLToPath(import.meta.url));
 /** Absolute path to the boxsh binary. Override with BOXSH env-var. */
 export const BOXSH =
   process.env.BOXSH ?? path.resolve(__dir, '../build/boxsh');
+
+/**
+ * Workspace temp dir — lives under $HOME on the same XFS volume, so newly
+ * allocated inodes carry large 64-bit numbers.  Use this instead of
+ * os.tmpdir() whenever the lower layer of an overlay must have realistic
+ * (large) inode numbers in order to exercise the EOVERFLOW copy-up path.
+ */
+export const TEMPDIR = path.resolve(__dir, '../temp');
+fs.mkdirSync(TEMPDIR, { recursive: true });
+
+// Remove all boxsh-* subdirs created under TEMPDIR when the process exits.
+// This is a belt-and-suspenders cleanup: each test already has its own
+// try/finally, but this handler catches anything left behind by aborted runs.
+process.on('exit', () => {
+  try {
+    for (const entry of fs.readdirSync(TEMPDIR)) {
+      if (entry.startsWith('boxsh-')) {
+        fs.rmSync(path.join(TEMPDIR, entry), { recursive: true, force: true });
+      }
+    }
+  } catch { /* best-effort */ }
+});
 
 // ---------------------------------------------------------------------------
 // Synchronous helpers

@@ -13,6 +13,7 @@
 #include <signal.h>
 #include <cerrno>
 #include <sys/stat.h>
+#include <pwd.h>
 
 // Bring in dash's main() under a renamed symbol so we can call it directly
 // when running in normal (non-RPC) mode.
@@ -34,11 +35,13 @@ void print_usage(const char *prog) {
         "  --shell PATH   Shell binary to use for executing commands (default: /bin/sh).\n"
         "\n"
         "Sandbox options (applied to every worker at fork time):\n"
-        "  --sandbox      Enable the global sandbox.\n"
+        "  --sandbox      Enable the sandbox.  Builds an isolated root from a fresh\n"
+        "                 tmpfs with read-only system directories (/usr, /proc, /dev,\n"
+        "                 selected /etc files) automatically mounted.  Everything else\n"
+        "                 is hidden unless explicitly exposed with --bind or --overlay.\n"
         "  --no-user-ns   Do not create a new user namespace (requires root for other ns).\n"
         "  --new-net-ns   Create a new network namespace (disables outbound network).\n"
         "  --new-pid-ns   Create a new PID namespace.\n"
-        "  --rootfs DIR   Pivot into DIR as the new root filesystem.\n"
         "  --bind SRC:DST[:ro]  Bind-mount SRC to DST inside the sandbox.\n"
         "                       Append ':ro' to make it read-only.\n"
         "  --overlay LOWER:UPPER:WORK:DST\n"
@@ -48,7 +51,6 @@ void print_usage(const char *prog) {
         "                       (must exist; writes persist between commands).\n"
         "  --proc DST           Mount procfs at DST inside the sandbox.\n"
         "  --tmpfs DST[:OPTS]   Mount an empty tmpfs at DST (OPTS: e.g. size=128m).\n"
-        "  --ro-root      Remount / as read-only after pivot_root.\n"
         "\n"
         "Quick-try mode:\n"
         "  --try          Launch a sandboxed shell on the current directory.\n"
@@ -137,12 +139,10 @@ static Cli parse_cli(int argc, char **argv, int &remaining_argc,
         {"no-user-ns",  no_argument,       nullptr, 'U'},
         {"new-net-ns",  no_argument,       nullptr, 'N'},
         {"new-pid-ns",  no_argument,       nullptr, 'P'},
-        {"rootfs",      required_argument, nullptr, 'r'},
         {"bind",        required_argument, nullptr, 'b'},
         {"overlay",     required_argument, nullptr, 'v'},
         {"proc",        required_argument, nullptr, 'F'},
         {"tmpfs",       required_argument, nullptr, 'T'},
-        {"ro-root",     no_argument,       nullptr, 'O'},
         {"try",         no_argument,       nullptr, 'y'},
         {"help",        no_argument,       nullptr, 'h'},
         {nullptr, 0, nullptr, 0}
@@ -163,7 +163,6 @@ static Cli parse_cli(int argc, char **argv, int &remaining_argc,
         case 'U': cli.sandbox.new_user_ns = false; break;
         case 'N': cli.sandbox.new_net_ns  = true; break;
         case 'P': cli.sandbox.new_pid_ns  = true; break;
-        case 'r': cli.sandbox.new_rootfs  = optarg; break;
         case 'b': {
             BindMount bm;
             if (!parse_bind(optarg, bm)) {
@@ -174,7 +173,6 @@ static Cli parse_cli(int argc, char **argv, int &remaining_argc,
             cli.sandbox.bind_mounts.push_back(std::move(bm));
             break;
         }
-        case 'O': cli.sandbox.readonly_root = true; break;
         case 'v': {
             OverlayMount om;
             if (!parse_overlay(optarg, om)) {
@@ -253,12 +251,43 @@ int main(int argc, char **argv) {
                      try_tmpdir.c_str());
 
         cli.sandbox.enabled = true;
-        boxsh::OverlayMount om;
-        om.lowerdir       = try_cwd;
-        om.upperdir       = upper;
-        om.workdir        = work;
-        om.container_path = try_cwd;
-        cli.sandbox.overlay_mounts.push_back(std::move(om));
+
+        // Determine the user's home directory.  Prefer $HOME; fall back to
+        // the passwd entry so we work correctly even when $HOME is unset.
+        std::string home_dir;
+        const char *home_env = getenv("HOME");
+        if (home_env && home_env[0] != '\0') {
+            home_dir = home_env;
+        } else {
+            struct passwd *pw = getpwuid(getuid());
+            if (pw && pw->pw_dir) home_dir = pw->pw_dir;
+        }
+
+        // $HOME: bind-mount read-only so it is accessible inside the sandbox
+        // without exposing writes to the host.  We deliberately avoid using
+        // $HOME as an overlayfs lower layer because /home/<user> can have an
+        // XFS inode number > INT32_MAX; overlayfs copy-up then fails with
+        // EOVERFLOW even with xino=off.
+        if (!home_dir.empty()) {
+            boxsh::BindMount hbm;
+            hbm.host_path      = home_dir;
+            hbm.container_path = home_dir;
+            hbm.readonly       = true;
+            cli.sandbox.bind_mounts.push_back(std::move(hbm));
+        }
+
+        // Always COW-overlay the CWD.  The overlay lower layer is the CWD
+        // directory itself, whose inode number is always small enough to avoid
+        // EOVERFLOW.  If CWD is inside $HOME the overlay at step 9 shadows the
+        // read-only home bind mount applied in step 6, so writes go to upper.
+        {
+            boxsh::OverlayMount om;
+            om.lowerdir       = try_cwd;
+            om.upperdir       = upper;
+            om.workdir        = work;
+            om.container_path = try_cwd;
+            cli.sandbox.overlay_mounts.push_back(std::move(om));
+        }
     }
 
     if (!cli.rpc_mode) {

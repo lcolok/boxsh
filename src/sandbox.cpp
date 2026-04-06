@@ -5,13 +5,19 @@
 #include <cstdio>
 #include <cstdlib>
 
+#include <dirent.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <sched.h>
 #include <sys/mount.h>
 #include <sys/stat.h>
+#include <sys/statfs.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
+
+#ifndef XFS_SUPER_MAGIC
+#define XFS_SUPER_MAGIC 0x58465342
+#endif
 
 namespace boxsh {
 
@@ -21,6 +27,20 @@ namespace boxsh {
 
 static std::string errno_str(const char *context) {
     return std::string(context) + ": " + std::strerror(errno);
+}
+
+// Recursively create directory and all parents (like mkdir -p).
+static bool mkdir_p(const std::string &path, mode_t mode, std::string &err) {
+    for (size_t pos = 1; pos <= path.size(); ++pos) {
+        if (pos == path.size() || path[pos] == '/') {
+            std::string prefix = path.substr(0, pos);
+            if (mkdir(prefix.c_str(), mode) != 0 && errno != EEXIST) {
+                err = errno_str(("mkdir_p: " + prefix).c_str());
+                return false;
+            }
+        }
+    }
+    return true;
 }
 
 // Write a single string to a file, used for uid_map / gid_map / setgroups.
@@ -37,19 +57,60 @@ static int do_pivot_root(const char *new_root, const char *put_old) {
     return syscall(SYS_pivot_root, new_root, put_old);
 }
 
-// Mount an overlayfs at 'dest' using caller-managed upper/work directories.
+// Returns true when the lower-layer filesystem requires directory pre-mirroring
+// to prevent EOVERFLOW during overlayfs directory copy-up in user namespaces.
+// XFS encodes file handles using inode numbers that may exceed the range
+// overlayfs can represent internally, causing copy-up to fail.  Pre-populating
+// upper with an empty directory skeleton avoids the copy-up entirely.
+static bool lower_needs_mirror_dirs(const std::string &lowerdir) {
+    struct statfs sfs;
+    if (statfs(lowerdir.c_str(), &sfs) != 0)
+        return true; // fail-safe: mirror anyway
+    return sfs.f_type == XFS_SUPER_MAGIC;
+}
+
+// Recursively mirror the directory skeleton of 'src' into 'dst' (dirs only).
+static void mirror_dirs(const std::string &src, const std::string &dst) {
+    DIR *dir = opendir(src.c_str());
+    if (!dir) return;
+    struct dirent *ent;
+    while ((ent = readdir(dir)) != nullptr) {
+        if (ent->d_name[0] == '.' &&
+            (ent->d_name[1] == '\0' ||
+             (ent->d_name[1] == '.' && ent->d_name[2] == '\0')))
+            continue;
+        std::string src_child = src + "/" + ent->d_name;
+        std::string dst_child = dst + "/" + ent->d_name;
+        struct stat st;
+        if (lstat(src_child.c_str(), &st) != 0) continue;
+        if (!S_ISDIR(st.st_mode)) continue;
+        // Ignore errors: the directory may already exist.
+        mkdir(dst_child.c_str(), 0755);
+        mirror_dirs(src_child, dst_child);
+    }
+    closedir(dir);
+}
+
 static bool mount_overlay_at(const std::string &lowerdir,
                                const std::string &dest,
                                const std::string &upper,
                                const std::string &work,
                                std::string &err) {
-    if (mkdir(dest.c_str(), 0755) != 0 && errno != EEXIST) {
-        err = errno_str(("mkdir overlay dest: " + dest).c_str());
-        return false;
-    }
+    if (!mkdir_p(dest, 0755, err)) return false;
+    // Pre-populate upper with the directory skeleton of lower only when the
+    // lower filesystem (XFS) cannot complete directory copy-up in a user
+    // namespace.  On other filesystems (tmpfs, ext4, …) copy-up works fine
+    // and we skip the potentially expensive pre-mirror step.
+    if (lower_needs_mirror_dirs(lowerdir))
+        mirror_dirs(lowerdir, upper);
+    // xino=off: disable cross-inode-number encoding between lower and upper
+    // layers.  Without this, overlayfs copy-up fails with EOVERFLOW when the
+    // lower filesystem (e.g. ext4) has inode numbers that exceed the range
+    // the upper filesystem (e.g. tmpfs) can represent.
     std::string opts = "lowerdir=" + lowerdir +
                        ",upperdir=" + upper +
-                       ",workdir="  + work;
+                       ",workdir="  + work +
+                       ",xino=off";
     if (mount("overlay", dest.c_str(), "overlay", 0, opts.c_str()) != 0) {
         err = errno_str(("mount overlay -> " + dest).c_str());
         return false;
@@ -57,11 +118,7 @@ static bool mount_overlay_at(const std::string &lowerdir,
     return true;
 }
 
-// Apply overlay mounts.  upper/work directories are provided by the caller
-// and must already exist on the host filesystem.
-//
-// 'dest_prefix' is prepended to container_path — use the new rootfs path
-// when pivot_root is in use, or empty otherwise.
+// Apply overlay mounts inside new_root.  dest_prefix is the new root path.
 //
 // Kernel requirements:
 //   - CLONE_NEWNS must already be active (mount namespace isolation).
@@ -111,11 +168,6 @@ static bool mount_tmpfs_at(const std::string &path,
     return true;
 }
 
-// Mount a tmpfs at 'path' for the new rootfs base (always uses default options).
-static bool mount_tmpfs(const std::string &path, std::string &err) {
-    return mount_tmpfs_at(path, "mode=0755", err);
-}
-
 // Recursively bind-mount 'src' to 'dst', creating 'dst' if needed.
 static bool bind_mount(const std::string &src, const std::string &dst,
                        bool readonly, std::string &err) {
@@ -127,10 +179,7 @@ static bool bind_mount(const std::string &src, const std::string &dst,
     }
 
     if (S_ISDIR(st.st_mode)) {
-        if (mkdir(dst.c_str(), 0755) != 0 && errno != EEXIST) {
-            err = errno_str(("mkdir bind-mount dst: " + dst).c_str());
-            return false;
-        }
+        if (!mkdir_p(dst, 0755, err)) return false;
     } else {
         // For regular files create an empty file as mount point.
         int fd = open(dst.c_str(), O_CREAT | O_WRONLY | O_CLOEXEC, 0644);
@@ -158,6 +207,83 @@ static bool bind_mount(const std::string &src, const std::string &dst,
     return true;
 }
 
+// Conditionally bind a host path into new_root if the source exists.
+// System directories don't need MS_RDONLY: write access is controlled by
+// host Unix permissions (the sandbox maps to real uid, not kernel root).
+static bool try_bind(const std::string &src, const std::string &new_root,
+                     std::string &err) {
+    struct stat st;
+    if (stat(src.c_str(), &st) != 0) return true; // not present, skip
+    return bind_mount(src, new_root + src, /*readonly=*/false, err);
+}
+
+
+// Set up the automatic read-only system mounts that every sandbox gets.
+// These provide a working environment without exposing writable host paths.
+static bool setup_system_mounts(const std::string &new_root, std::string &err) {
+    // /usr — all system binaries and libraries.
+    if (!try_bind("/usr", new_root, err)) return false;
+
+    // On merged-usr distros /bin /sbin /lib /lib64 are symlinks to usr/*.
+    // On non-merged distros they are real directories that need binding.
+    static const char *const usr_compat[] = {
+        "/bin", "/sbin", "/lib", "/lib32", "/lib64", "/libx32", nullptr
+    };
+    for (int i = 0; usr_compat[i]; i++) {
+        struct stat lst;
+        if (lstat(usr_compat[i], &lst) != 0) continue;
+        if (S_ISLNK(lst.st_mode)) {
+            // Read the symlink target and recreate it inside new_root.
+            char target[256] = {};
+            if (readlink(usr_compat[i], target, sizeof(target) - 1) > 0) {
+                std::string dst = new_root + usr_compat[i];
+                struct stat dst_st;
+                if (stat(dst.c_str(), &dst_st) != 0)
+                    symlink(target, dst.c_str()); // best-effort
+            }
+        } else {
+            // Real directory — bind mount.
+            if (!try_bind(usr_compat[i], new_root, err)) return false;
+        }
+    }
+
+    // /proc — bind-mount from host; works in user namespace without new PID ns.
+    // A fresh proc mount requires CAP_SYS_ADMIN beyond user-ns scope on some
+    // kernels; a bind-mount is always allowed with CLONE_NEWNS.
+    if (mkdir((new_root + "/proc").c_str(), 0755) != 0 && errno != EEXIST) {
+        err = errno_str("mkdir /proc");
+        return false;
+    }
+    if (mount("/proc", (new_root + "/proc").c_str(), nullptr,
+              MS_BIND | MS_REC, nullptr) != 0) {
+        err = errno_str("bind /proc");
+        return false;
+    }
+
+    // /dev — bind entire host /dev recursively so all sub-mounts (devpts, shm,
+    // hugepages, mqueue) are included. Device access is still governed by the
+    // real uid and kernel DAC; no additional filtering is needed.
+    if (!try_bind("/dev", new_root, err)) return false;
+
+    // /tmp — fresh writable tmpfs; never shared with host.
+    if (!mount_tmpfs_at(new_root + "/tmp", "mode=1777", err)) return false;
+
+    // /run — bind from host so symlink targets under /run (e.g. resolv.conf)
+    // resolve correctly inside the sandbox.
+    if (!try_bind("/run", new_root, err)) return false;
+
+    // /etc — bind entire host /etc. All files are world-readable by design;
+    // write access is controlled by host Unix permissions (real uid).
+    if (!try_bind("/etc", new_root, err)) return false;
+
+    // /var — bind from host so package databases (dpkg, rpm) and other
+    // system state are accessible inside the sandbox.
+    if (!try_bind("/var", new_root, err)) return false;
+
+    return true;
+}
+
+
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
@@ -170,32 +296,26 @@ SandboxResult sandbox_apply(const SandboxConfig &cfg) {
         return res;
     }
 
-    // --- 1. Build unshare flags ---
-    int unshare_flags = 0;
-    if (cfg.new_user_ns)  unshare_flags |= CLONE_NEWUSER;
-    if (cfg.new_mount_ns) unshare_flags |= CLONE_NEWNS;
-    if (cfg.new_pid_ns)   unshare_flags |= CLONE_NEWPID;
-    if (cfg.new_net_ns)   unshare_flags |= CLONE_NEWNET;
+    // Save CWD before any namespace changes so we can restore it after
+    // pivot_root moves the process into the new root.
+    char *cwd_buf = getcwd(nullptr, 0);
+    std::string saved_cwd = cwd_buf ? cwd_buf : "/";
+    free(cwd_buf);
 
-    if (unshare_flags == 0 && cfg.new_rootfs.empty() && !cfg.readonly_root) {
-        res.ok = true;
+    // --- 1. Unshare namespaces ---
+    int unshare_flags = CLONE_NEWNS; // always need a private mount namespace
+    if (cfg.new_user_ns) unshare_flags |= CLONE_NEWUSER;
+    if (cfg.new_pid_ns)  unshare_flags |= CLONE_NEWPID;
+    if (cfg.new_net_ns)  unshare_flags |= CLONE_NEWNET;
+
+    if (unshare(unshare_flags) != 0) {
+        res.error = errno_str("unshare");
         return res;
     }
 
-    // --- 2. Unshare namespaces ---
-    if (unshare_flags != 0) {
-        if (unshare(unshare_flags) != 0) {
-            res.error = errno_str("unshare");
-            return res;
-        }
-    }
-
-    // --- 3. Write uid/gid mapping (only when entering user ns from child side) ---
-    // When called in the child after fork(), the parent must have written the
-    // uid_map already.  When called via unshare() (no separate fork), we write
-    // the map ourselves because we ARE both parent and child in that case.
+    // --- 2. Write uid/gid mapping ---
+    // When called via unshare() (no separate fork) we write the map ourselves.
     if (cfg.new_user_ns) {
-        // Deny setgroups before writing gid_map (kernel requirement).
         char self_setgroups[] = "/proc/self/setgroups";
         write_file(self_setgroups, "deny");
 
@@ -216,114 +336,118 @@ SandboxResult sandbox_apply(const SandboxConfig &cfg) {
         }
     }
 
-    // --- 4. Set up new rootfs (pivot_root) ---
-    if (!cfg.new_rootfs.empty()) {
-        const std::string &new_root = cfg.new_rootfs;
-        // The directory must already be a mount point for pivot_root.
-        // Mount a tmpfs there first.
-        if (!mount_tmpfs(new_root, res.error)) return res;
+    // --- 3. Make all existing mounts private so our changes don't propagate ---
+    if (mount(nullptr, "/", nullptr, MS_SLAVE | MS_REC, nullptr) != 0) {
+        res.error = errno_str("mount --make-rslave /");
+        return res;
+    }
 
-        // Apply bind mounts.
-        for (const auto &bm : cfg.bind_mounts) {
-            std::string dst = new_root + bm.container_path;
-            if (!bind_mount(bm.host_path, dst, bm.readonly, res.error))
-                return res;
-        }
+    // --- 4. Build new root on a tmpfs ---
+    // We use /tmp as staging area (same approach as bubblewrap).
+    // Mount a fresh tmpfs there; it becomes the new root base.
+    const std::string new_root = "/tmp/.boxsh-newroot";
+    if (mkdir(new_root.c_str(), 0755) != 0 && errno != EEXIST) {
+        res.error = errno_str("mkdir newroot");
+        return res;
+    }
+    if (mount("tmpfs", new_root.c_str(), "tmpfs",
+              MS_NOSUID | MS_NODEV, "mode=0755") != 0) {
+        res.error = errno_str("mount tmpfs newroot");
+        return res;
+    }
 
-        // Apply overlay mounts (before pivot_root so paths are relative to new_root).
-        if (!apply_overlay_mounts(cfg.overlay_mounts, new_root, res.error))
+    // --- 5. Automatic read-only system mounts ---
+    if (!setup_system_mounts(new_root, res.error)) return res;
+
+    // --- 6. User-specified bind mounts ---
+    for (const auto &bm : cfg.bind_mounts) {
+        std::string dst = new_root + bm.container_path;
+        if (!bind_mount(bm.host_path, dst, bm.readonly, res.error))
             return res;
+    }
 
-        // Apply proc mounts inside new_root.
-        for (const auto &pm : cfg.proc_mounts) {
-            if (!mount_proc(new_root + pm.container_path, res.error))
-                return res;
-        }
-
-        // Apply tmpfs mounts inside new_root.
-        for (const auto &tm : cfg.tmpfs_mounts) {
-            if (!mount_tmpfs_at(new_root + tm.container_path, tm.options, res.error))
-                return res;
-        }
-
-        // Create the put_old directory inside new_root.
-        std::string put_old = new_root + "/.old_root";
-        if (mkdir(put_old.c_str(), 0700) != 0) {
-            res.error = errno_str("mkdir put_old");
+    // --- 7. User-specified extra tmpfs mounts ---
+    for (const auto &tm : cfg.tmpfs_mounts) {
+        if (!mount_tmpfs_at(new_root + tm.container_path, tm.options, res.error))
             return res;
-        }
+    }
 
-        // pivot_root requires new_root to be a mount point.
-        // Bind-mount it onto itself to guarantee this.
-        if (mount(new_root.c_str(), new_root.c_str(), nullptr,
-                  MS_BIND, nullptr) != 0) {
-            res.error = errno_str("bind-mount new_root onto itself");
+    // --- 8. User-specified proc mounts ---
+    for (const auto &pm : cfg.proc_mounts) {
+        if (!mount_proc(new_root + pm.container_path, res.error))
             return res;
-        }
+    }
 
-        if (do_pivot_root(new_root.c_str(), put_old.c_str()) != 0) {
-            res.error = errno_str("pivot_root");
-            return res;
+    // --- 8b. Auto-bind CWD into the new root (if not already covered) ---
+    // Ensures CWD-relative writes reach the host filesystem.
+    // Overlays in step 9 will shadow this bind if CWD falls under an overlay
+    // mount point, so overlay-based CWD is still correctly captured.
+    if (!saved_cwd.empty()) {
+        auto is_under = [](const std::string &path,
+                           const std::string &prefix) -> bool {
+            return path == prefix ||
+                   (path.size() > prefix.size() && path[prefix.size()] == '/' &&
+                    path.compare(0, prefix.size(), prefix) == 0);
+        };
+        // System dirs already set up: no auto-bind needed for these.
+        static const char *sys_prefixes[] = {
+            "/usr", "/bin", "/sbin", "/lib", "/proc", "/dev",
+        };
+        bool cwd_covered = false;
+        for (auto &p : sys_prefixes)
+            if (is_under(saved_cwd, p)) { cwd_covered = true; break; }
+        if (!cwd_covered) {
+            for (const auto &bm : cfg.bind_mounts)
+                if (is_under(saved_cwd, bm.container_path)) { cwd_covered = true; break; }
         }
-
-        // Now inside the new root. Unmount old root.
-        if (umount2("/.old_root", MNT_DETACH) != 0) {
-            res.error = errno_str("umount2 old_root");
-            return res;
-        }
-        if (rmdir("/.old_root") != 0) {
-            // Non-fatal: just warn via stderr, don't abort.
-            std::fprintf(stderr, "boxsh: sandbox: rmdir /.old_root: %s\n",
-                         std::strerror(errno));
-        }
-    } else if (!cfg.bind_mounts.empty() || !cfg.overlay_mounts.empty() ||
-               !cfg.proc_mounts.empty() || !cfg.tmpfs_mounts.empty()) {
-        // No new root: apply all mounts in-place into the new mount namespace
-        // (CLONE_NEWNS must already be active).
-        for (const auto &bm : cfg.bind_mounts) {
-            if (!bind_mount(bm.host_path, bm.container_path,
-                            bm.readonly, res.error))
-                return res;
-        }
-        if (!apply_overlay_mounts(cfg.overlay_mounts, "", res.error))
-            return res;
-        // If the process CWD falls inside an overlay mount point, refresh the
-        // CWD dentry so that relative paths go through the overlay and not the
-        // underlying filesystem.  This is needed because unshare+mount updates
-        // the mount table but the kernel's stored CWD (dentry,vfsmount) pair
-        // still points at the lower layer until the next absolute path lookup.
-        if (!cfg.overlay_mounts.empty()) {
-            char *cwd_buf = getcwd(nullptr, 0);
-            if (cwd_buf) {
-                std::string cwd(cwd_buf);
-                free(cwd_buf);
-                for (const auto &ov : cfg.overlay_mounts) {
-                    if (cwd == ov.container_path ||
-                        cwd.substr(0, ov.container_path.size() + 1) ==
-                            ov.container_path + "/") {
-                        chdir(cwd.c_str());
-                        break;
-                    }
-                }
-            }
-        }
-        for (const auto &pm : cfg.proc_mounts) {
-            if (!mount_proc(pm.container_path, res.error))
-                return res;
-        }
-        for (const auto &tm : cfg.tmpfs_mounts) {
-            if (!mount_tmpfs_at(tm.container_path, tm.options, res.error))
-                return res;
+        if (!cwd_covered) {
+            // Best-effort: ignore failures (CWD may be a system path we handle
+            // specially, e.g. /tmp is fresh tmpfs — in that case CWD falls back to /).
+            std::string cwd_err;
+            bind_mount(saved_cwd, new_root + saved_cwd, false, cwd_err);
         }
     }
 
-    // --- 5. Optional: make root read-only ---
-    if (cfg.readonly_root) {
-        if (mount(nullptr, "/", nullptr,
-                  MS_REMOUNT | MS_RDONLY | MS_BIND, nullptr) != 0) {
-            res.error = errno_str("remount / rdonly");
-            return res;
-        }
+    // --- 9. Overlay mounts (applied inside new_root before pivot_root) ---
+    if (!apply_overlay_mounts(cfg.overlay_mounts, new_root, res.error))
+        return res;
+
+    // --- 10. pivot_root into new_root ---
+    // Bind new_root onto itself so it is a mount point (pivot_root requirement).
+    if (mount(new_root.c_str(), new_root.c_str(), nullptr,
+              MS_BIND | MS_REC, nullptr) != 0) {
+        res.error = errno_str("bind-mount newroot onto itself");
+        return res;
+    }
+
+    // Use the pivot_root(".", ".") trick: chdir then pivot in-place.
+    if (chdir(new_root.c_str()) != 0) {
+        res.error = errno_str("chdir newroot");
+        return res;
+    }
+    if (do_pivot_root(".", ".") != 0) {
+        res.error = errno_str("pivot_root");
+        return res;
+    }
+
+    // Now "/" is the old root, "." is the new root.
+    // Unmount the old root (detach so busy mounts don't fail).
+    if (umount2(".", MNT_DETACH) != 0) {
+        res.error = errno_str("umount2 old root");
+        return res;
+    }
+
+    // Switch into the new "/".
+    if (chdir("/") != 0) {
+        res.error = errno_str("chdir / after pivot_root");
+        return res;
+    }
+
+    // --- 11. Restore CWD inside the new root ---
+    // If the old CWD exists inside the new root, go back there.
+    // Otherwise fall back to "/".
+    if (!saved_cwd.empty() && chdir(saved_cwd.c_str()) != 0) {
+        chdir("/");
     }
 
     res.ok = true;

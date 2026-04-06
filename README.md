@@ -298,7 +298,6 @@ Sandbox options (applied in both shell mode and RPC mode):
   --no-user-ns         Skip creating a new user namespace (requires root for other ns).
   --new-net-ns         Create a new network namespace (loopback only).
   --new-pid-ns         Create a new PID namespace.
-  --rootfs DIR         pivot_root into DIR as the new root filesystem.
   --bind SRC:DST[:ro]  Bind-mount SRC at DST inside the sandbox.
                        Append :ro for a read-only bind.
   --overlay LOWER:UPPER:WORK:DST
@@ -307,7 +306,6 @@ Sandbox options (applied in both shell mode and RPC mode):
                        Writes land in UPPER and persist across commands.
   --proc DST           Mount procfs at DST inside the sandbox.
   --tmpfs DST[:OPTS]   Mount a fresh empty tmpfs at DST (e.g. size=128m).
-  --ro-root            Remount / read-only after pivot_root.
 ```
 
 ---
@@ -321,22 +319,20 @@ Pass `--sandbox` to enable Linux namespace isolation. The sandbox is applied onc
 boxsh --rpc --workers 4 --sandbox --new-net-ns
 
 # Shell mode — sandbox applied before dash starts
-boxsh --sandbox --rootfs /path/to/sysroot --bind /proc:/proc --proc /proc -c 'ls /'
+boxsh --sandbox --bind /data:/data -c 'ls /'
 ```
 
 **What each flag does:**
 
 | Flag | Kernel mechanism | Effect |
 |---|---|---|
-| `--sandbox` | `CLONE_NEWUSER` + `CLONE_NEWNS` | User/mount namespace; current UID mapped as root inside |
+| `--sandbox` | `CLONE_NEWUSER` + `CLONE_NEWNS` | User/mount namespace; auto-includes `/usr`, `/proc`, `/dev`, `/tmp`, selected `/etc` files; current UID mapped as root inside |
 | `--new-net-ns` | `CLONE_NEWNET` | Loopback-only; outbound network blocked |
 | `--new-pid-ns` | `CLONE_NEWPID` | Isolated PID tree; host processes not visible |
-| `--rootfs DIR` | `pivot_root(2)` | Change root to DIR |
 | `--bind SRC:DST[:ro]` | `MS_BIND` | Bind-mount a host path into the sandbox |
 | `--overlay LOWER:UPPER:WORK:DST` | `overlayfs` | Writable overlay over a read-only lower layer |
 | `--proc DST` | `proc` | Mount procfs at DST |
 | `--tmpfs DST[:OPTS]` | `tmpfs` | Fresh empty tmpfs at DST |
-| `--ro-root` | `MS_REMOUNT\|MS_RDONLY` | Make `/` read-only after pivot_root |
 
 **Kernel requirements for `--overlay`:**
 

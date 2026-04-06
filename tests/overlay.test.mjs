@@ -8,11 +8,10 @@
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import { spawnSync, spawn } from 'node:child_process';
 import { createInterface } from 'node:readline';
-import { run, BOXSH } from './helpers.mjs';
+import { run, BOXSH, TEMPDIR } from './helpers.mjs';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -20,7 +19,7 @@ import { run, BOXSH } from './helpers.mjs';
 
 /** Create a temp dir subtree for overlay testing. */
 function makeOverlayDirs() {
-  const base = fs.mkdtempSync(path.join(os.tmpdir(), 'boxsh-ovl-'));
+  const base = fs.mkdtempSync(path.join(TEMPDIR, 'boxsh-ovl-'));
   const lower = path.join(base, 'lower');
   const upper = path.join(base, 'upper');
   const work  = path.join(base, 'work');
@@ -238,7 +237,7 @@ describe('sandbox — overlay CWD refresh', () => {
   test('CWD outside mount point is unaffected', () => {
     // Sanity check: when CWD is not under the overlay, normal writes still work.
     const { lower, upper, work, dst, cleanup } = makeOverlayDirs();
-    const outsideDir = fs.mkdtempSync(path.join(os.tmpdir(), 'boxsh-outside-'));
+    const outsideDir = fs.mkdtempSync(path.join(TEMPDIR, 'boxsh-outside-'));
     try {
       const r = spawnSync(
         BOXSH,
@@ -275,7 +274,7 @@ describe('sandbox — overlay CWD refresh', () => {
 describe('sandbox — multi-layer overlay (session branching)', () => {
   /** Create a deeper temp dir tree for multi-layer tests. */
   function makeMultiLayerDirs() {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'boxsh-ml-'));
+    const root = fs.mkdtempSync(path.join(TEMPDIR, 'boxsh-ml-'));
     const dirs = {};
     for (const name of ['base', 'upper_a', 'work_a', 'upper_a1', 'work_a1', 'upper_b', 'work_b', 'dst']) {
       dirs[name] = path.join(root, name);
@@ -557,6 +556,166 @@ describe('sandbox — overlay lower-layer mutation after mount', () => {
         'after copy-up, lower mutation must NOT override the upper copy');
     } finally {
       cleanup();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Overlay lower-layer isolation
+//
+// The lower, upper, and work directories are implementation details of the
+// overlay setup — they must not be directly accessible by their host paths
+// inside the sandbox.  Only the DST (overlay mount point) is visible.
+// ---------------------------------------------------------------------------
+
+describe('sandbox — overlay lower-layer isolation', () => {
+  test('lower directory is not accessible by host path inside sandbox', () => {
+    const { lower, upper, work, dst, cleanup } = makeOverlayDirs();
+    fs.writeFileSync(path.join(lower, 'secret.txt'), 'lower-secret\n');
+    try {
+      // lower lives in host /tmp; sandbox /tmp is fresh, so lower/ does not exist.
+      const notVisible = rpcWith(
+        ['--overlay', `${lower}:${upper}:${work}:${dst}`],
+        `cat "${lower}/secret.txt" 2>&1; echo exit:$?`,
+      );
+      assert.equal(notVisible.exit_code, 0, 'shell itself must exit 0');
+      assert.ok(
+        notVisible.stdout.includes('No such file') || notVisible.stdout.includes('exit:1'),
+        `expected lower to be inaccessible inside sandbox, got: ${notVisible.stdout}`,
+      );
+      // The same file IS readable via the overlay DST.
+      const viaOverlay = rpcWith(
+        ['--overlay', `${lower}:${upper}:${work}:${dst}`],
+        `cat "${dst}/secret.txt"`,
+      );
+      assert.equal(viaOverlay.exit_code, 0);
+      assert.equal(viaOverlay.stdout, 'lower-secret\n');
+    } finally {
+      cleanup();
+    }
+  });
+
+  test('upper and work directories are not accessible inside sandbox', () => {
+    const { lower, upper, work, dst, cleanup } = makeOverlayDirs();
+    try {
+      // upper and work are siblings of dst under /tmp/boxsh-ovl-XXX/ which
+      // does exist as a directory in the sandbox (created by mkdir_p), but
+      // the upper/ and work/ subdirectories were never created there.
+      const resp = rpcWith(
+        ['--overlay', `${lower}:${upper}:${work}:${dst}`],
+        `[ -d "${upper}" ] && echo accessible || echo inaccessible`,
+      );
+      assert.equal(resp.exit_code, 0);
+      assert.equal(resp.stdout.trim(), 'inaccessible',
+        'upper directory must not be accessible inside sandbox');
+    } finally {
+      cleanup();
+    }
+  });
+
+  test('writing inside sandbox does not expose lower path as a side effect', () => {
+    // Creating a new file via the overlay DST triggers a copy-up into upper.
+    // This must not cause the lower directory to become accessible at its host path.
+    const { lower, upper, work, dst, cleanup } = makeOverlayDirs();
+    fs.writeFileSync(path.join(lower, 'base.txt'), 'from-lower\n');
+    try {
+      const resp = rpcWith(
+        ['--overlay', `${lower}:${upper}:${work}:${dst}`],
+        // Write via dst (triggers copy-up), then try to reach lower by host path.
+        `echo new > "${dst}/new.txt" && [ -d "${lower}" ] && echo lower-visible || echo lower-hidden`,
+      );
+      assert.equal(resp.exit_code, 0);
+      assert.equal(resp.stdout.trim(), 'lower-hidden',
+        'lower directory must remain inaccessible after copy-up',
+      );
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Overlay copy-up correctness (xino=off)
+//
+// overlayfs copy-up can fail with EOVERFLOW when the lower filesystem's inode
+// numbers exceed what the upper tmpfs can encode (xino feature).  The fix is
+// mounting with xino=off.  These tests exercise the copy-up path against the
+// real host filesystem as the lower layer, which has large inode numbers.
+// ---------------------------------------------------------------------------
+
+describe('sandbox — overlay copy-up without EOVERFLOW', () => {
+  test('writing a new file into an existing lower-layer subdirectory succeeds', () => {
+    // This is the exact pattern from fibmod_test.js:
+    //   fs.writeFile(path.join(__dirname, 'module', 'check.js'), '')
+    // where __dirname/module/ exists in the lower layer (host CWD).
+    const lower = fs.mkdtempSync(path.join(TEMPDIR, 'boxsh-xino-lower-'));
+    const tmp   = fs.mkdtempSync(path.join(TEMPDIR, 'boxsh-xino-tmp-'));
+    const upper = path.join(tmp, 'upper');
+    const work  = path.join(tmp, 'work');
+    fs.mkdirSync(upper); fs.mkdirSync(work);
+    try {
+      fs.mkdirSync(path.join(lower, 'module'));
+      fs.writeFileSync(path.join(lower, 'module', 'existing.js'), '// existing\n');
+      const r = spawnSync(
+        BOXSH,
+        ['--sandbox',
+         '--overlay', `${lower}:${upper}:${work}:${lower}`,
+         '-c', `touch "${lower}/module/new1.js" && touch "${lower}/module/new2.js" && echo ok`],
+        { encoding: 'utf8', cwd: lower, timeout: 5000 },
+      );
+      assert.equal(r.status, 0,
+        `copy-up failed (EOVERFLOW?): exit=${r.status}\nstderr: ${r.stderr}\nstdout: ${r.stdout}`);
+      assert.equal(r.stdout.trim(), 'ok');
+    } finally {
+      spawnSync('rm', ['-rf', lower, tmp]);
+    }
+  });
+
+  test('copy-up of a lower-layer file for modification succeeds', () => {
+    // Modifying an existing lower-layer file triggers copy-up of that file.
+    const lower = fs.mkdtempSync(path.join(TEMPDIR, 'boxsh-xino-lower-'));
+    const tmp   = fs.mkdtempSync(path.join(TEMPDIR, 'boxsh-xino-tmp-'));
+    const upper = path.join(tmp, 'upper');
+    const work  = path.join(tmp, 'work');
+    fs.mkdirSync(upper); fs.mkdirSync(work);
+    try {
+      fs.writeFileSync(path.join(lower, 'config.json'), '{"v":1}\n');
+      const r = spawnSync(
+        BOXSH,
+        ['--sandbox',
+         '--overlay', `${lower}:${upper}:${work}:${lower}`,
+         '-c', `echo '{"v":2}' > "${lower}/config.json" && cat "${lower}/config.json"`],
+        { encoding: 'utf8', cwd: lower, timeout: 5000 },
+      );
+      assert.equal(r.status, 0,
+        `copy-up of existing file failed: exit=${r.status}\nstderr: ${r.stderr}`);
+      assert.match(r.stdout, /\{"v":2\}/);
+      // Host file must be unchanged (COW guarantee).
+      assert.equal(fs.readFileSync(path.join(lower, 'config.json'), 'utf8'), '{"v":1}\n');
+    } finally {
+      spawnSync('rm', ['-rf', lower, tmp]);
+    }
+  });
+
+  test('--try mode: writing into an existing subdirectory of CWD succeeds', () => {
+    // End-to-end via --try: mirrors the fibmod_test.js scenario exactly.
+    const cwd = fs.mkdtempSync(path.join(TEMPDIR, 'boxsh-xino-'));
+    try {
+      fs.mkdirSync(path.join(cwd, 'module'));
+      fs.writeFileSync(path.join(cwd, 'module', 'seed.js'), '// seed\n');
+      const r = spawnSync(
+        BOXSH,
+        ['--try', '-c',
+         `touch module/check1.js && touch module/check2.js && echo ok`],
+        { encoding: 'utf8', cwd, timeout: 5000 },
+      );
+      assert.equal(r.status, 0,
+        `--try copy-up failed: exit=${r.status}\nstderr: ${r.stderr}\nstdout: ${r.stdout}`);
+      assert.equal(r.stdout.trim(), 'ok');
+      // Host module/ must be untouched.
+      assert.deepEqual(fs.readdirSync(path.join(cwd, 'module')), ['seed.js']);
+    } finally {
+      spawnSync('rm', ['-rf', cwd]);
     }
   });
 });

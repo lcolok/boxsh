@@ -46,7 +46,7 @@ When you pass `--sandbox`, boxsh creates an isolated environment for the shell p
 | **PID isolation** (`--new-pid-ns`) | The sandbox has its own process tree. Host processes are invisible and cannot be signaled. |
 | **Network isolation** (`--new-net-ns`) | The sandbox gets an empty network stack. No outbound connections — `curl`, `wget`, `npm install` (from registry) all fail. |
 
-With `--sandbox` alone, the host root filesystem is still visible — only the mount table is private, so overlay and bind mounts don't affect the host. If you also pass `--rootfs DIR`, boxsh switches the root to a clean tmpfs containing only the mounts you specify (overlays, binds, `/proc`, `/tmp`), and the host root becomes inaccessible.
+With `--sandbox`, boxsh switches the root to a clean tmpfs and automatically includes standard system directories (`/usr`, `/proc`, `/dev`, `/tmp`, and selected `/etc` files). Only the mounts you specify are accessible; everything else is hidden.
 
 ```mermaid
 flowchart TB
@@ -1047,26 +1047,6 @@ boxsh --sandbox --bind /etc/resolv.conf:/etc/resolv.conf:ro -c 'cat /etc/resolv.
 
 Format: `--bind SRC:DST[:ro]`
 
-#### Custom Root Filesystem
-
-Build a minimal root filesystem with `--rootfs`, `--proc`, and `--tmpfs`:
-
-```sh
-boxsh --sandbox \
-  --rootfs /path/to/sysroot \
-  --bind /usr:/usr:ro \
-  --proc /proc \
-  --tmpfs /tmp \
-  --ro-root \
-  -c 'ls /'
-```
-
-| Flag | Effect |
-|---|---|
-| `--rootfs DIR` | Use DIR as the new root filesystem |
-| `--proc DST` | Mount procfs at DST |
-| `--tmpfs DST[:OPTS]` | Mount empty tmpfs at DST (e.g. `--tmpfs /tmp:size=128m`) |
-| `--ro-root` | Remount `/` read-only after pivot |
 
 ### Node.js SDK
 
