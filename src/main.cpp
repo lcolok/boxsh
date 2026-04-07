@@ -291,6 +291,17 @@ int main(int argc, char **argv) {
     }
 
     if (!cli.rpc_mode) {
+        // Capture user info before entering sandbox (passwd/hostname may
+        // become unavailable inside the namespace).
+        std::string prompt_user = "user";
+        char prompt_host[256] = "localhost";
+        {
+            struct passwd *pw = getpwuid(getuid());
+            if (pw && pw->pw_name) prompt_user = pw->pw_name;
+            gethostname(prompt_host, sizeof(prompt_host));
+            prompt_host[sizeof(prompt_host) - 1] = '\0';
+        }
+
         // Normal shell mode: apply sandbox (if requested) then run dash.
         if (cli.sandbox.enabled) {
             boxsh::SandboxResult sr = boxsh::sandbox_apply(cli.sandbox);
@@ -301,6 +312,45 @@ int main(int argc, char **argv) {
             }
         }
 
+        bool interactive = (shell_argc == 0 && isatty(STDIN_FILENO));
+
+        // Build a dash-friendly PS1 that mimics the user's bash prompt.
+        // dash does not support bash PS1 escapes (\u, \h, \w), so we
+        // bake in user/host and use command substitution for ~ in $PWD.
+        // ANSI escapes are wrapped in \001..\001 for libedit (EL_PROMPT_ESC).
+        if (interactive) {
+            const char *esc_on  = "\001\033[";
+            const char *esc_off = "\001";
+            const char *green_bold = "01;32m";
+            const char *blue_bold  = "01;34m";
+            const char *reset      = "00m";
+
+            // Replace $HOME prefix with ~ using inline case statement
+            const char *path_expr =
+                "$(case \"$PWD\" in "
+                "\"$HOME\") echo '~';; "
+                "\"$HOME\"/*) echo \"~${PWD#\"$HOME\"}\";; "
+                "*) echo \"$PWD\";; esac)";
+
+            std::string ps1;
+            // Boxsh environment prefix
+            if (cli.try_mode)
+                ps1 += "[boxsh:try] ";
+            else
+                ps1 += "[boxsh] ";
+            // green bold user@host
+            ps1 += esc_on; ps1 += green_bold; ps1 += esc_off;
+            ps1 += prompt_user; ps1 += "@"; ps1 += prompt_host;
+            ps1 += esc_on; ps1 += reset; ps1 += esc_off;
+            ps1 += ":";
+            // blue bold path
+            ps1 += esc_on; ps1 += blue_bold; ps1 += esc_off;
+            ps1 += path_expr;
+            ps1 += esc_on; ps1 += reset; ps1 += esc_off;
+            ps1 += "$ ";
+            setenv("PS1", ps1.c_str(), 1);
+        }
+
         // Reconstruct argv for dash: argv[0] is the shell binary name.
         std::vector<char *> dash_args;
         dash_args.push_back(argv[0]);
@@ -308,7 +358,7 @@ int main(int argc, char **argv) {
         // Only inject -E when stdin is a terminal and the user has not
         // supplied their own -c / script file (i.e. truly interactive).
         static char emacs_flag[] = "-E";
-        if (shell_argc == 0 && isatty(STDIN_FILENO))
+        if (interactive)
             dash_args.push_back(emacs_flag);
         for (int i = 0; i < shell_argc; i++)
             dash_args.push_back(shell_argv[i]);

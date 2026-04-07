@@ -115,7 +115,7 @@ histedit(void)
 			if (el != NULL) {
 				if (hist)
 					el_set(el, EL_HIST, history, hist);
-				el_set(el, EL_PROMPT, getprompt);
+				el_set(el, EL_PROMPT_ESC, getprompt, '\1');
 				/* Register the completion function (binding set later,
 				 * after EL_EDITOR, so it is not overwritten). */
 				el_set(el, EL_ADDFN, "ed-complete",
