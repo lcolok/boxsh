@@ -719,3 +719,131 @@ describe('sandbox — overlay copy-up without EOVERFLOW', () => {
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// fuse-overlayfs fallback
+//
+// On XFS with inode numbers > 2^31, kernel overlayfs fails with EINVAL in a
+// user namespace.  boxsh should automatically fall back to fuse-overlayfs.
+// These tests verify the fallback works, including a mixed scenario where one
+// overlay uses kernel overlayfs and another uses fuse-overlayfs in the same
+// sandbox session.
+// ---------------------------------------------------------------------------
+
+describe('sandbox — fuse-overlayfs fallback', () => {
+  // Skip the entire suite if fuse-overlayfs is not installed.
+  const hasFuseOverlayfs = spawnSync('which', ['fuse-overlayfs']).status === 0;
+
+  // Create overlay dirs under TEMPDIR (XFS, large inodes) so kernel overlayfs
+  // will fail and trigger the fuse-overlayfs fallback.
+  function makeXfsDirs() {
+    const base = fs.mkdtempSync(path.join(TEMPDIR, 'boxsh-fuse-'));
+    const lower = path.join(base, 'lower');
+    const upper = path.join(base, 'upper');
+    const work  = path.join(base, 'work');
+    const dst   = path.join(base, 'dst');
+    for (const d of [lower, upper, work, dst]) fs.mkdirSync(d);
+    return {
+      lower, upper, work, dst,
+      cleanup: () => spawnSync('rm', ['-rf', base]),
+    };
+  }
+
+  test('single overlay on XFS falls back to fuse-overlayfs', { skip: !hasFuseOverlayfs && 'fuse-overlayfs not installed' }, () => {
+    const d = makeXfsDirs();
+    try {
+      fs.writeFileSync(path.join(d.lower, 'hello.txt'), 'fuse-lower\n');
+      const resp = rpcWith(
+        ['--overlay', `${d.lower}:${d.upper}:${d.work}:${d.dst}`],
+        `cat ${d.dst}/hello.txt`,
+      );
+      assert.equal(resp.exit_code, 0, `cmd failed; stderr: ${resp.stderr}`);
+      assert.equal(resp.stdout, 'fuse-lower\n');
+    } finally {
+      d.cleanup();
+    }
+  });
+
+  test('fuse-overlayfs COW: writes go to upper, lower unchanged', { skip: !hasFuseOverlayfs && 'fuse-overlayfs not installed' }, () => {
+    const d = makeXfsDirs();
+    try {
+      fs.writeFileSync(path.join(d.lower, 'data.txt'), 'original\n');
+      const resp = rpcWith(
+        ['--overlay', `${d.lower}:${d.upper}:${d.work}:${d.dst}`],
+        `echo modified > ${d.dst}/data.txt && echo new > ${d.dst}/new.txt`,
+      );
+      assert.equal(resp.exit_code, 0, `cmd failed; stderr: ${resp.stderr}`);
+      assert.equal(fs.readFileSync(path.join(d.lower, 'data.txt'), 'utf8'), 'original\n');
+      assert.equal(fs.readFileSync(path.join(d.upper, 'data.txt'), 'utf8'), 'modified\n');
+      assert.equal(fs.readFileSync(path.join(d.upper, 'new.txt'), 'utf8'), 'new\n');
+    } finally {
+      d.cleanup();
+    }
+  });
+
+  test('--try mode on XFS directory uses fuse-overlayfs', { skip: !hasFuseOverlayfs && 'fuse-overlayfs not installed' }, () => {
+    const cwd = fs.mkdtempSync(path.join(TEMPDIR, 'boxsh-fuse-try-'));
+    try {
+      fs.writeFileSync(path.join(cwd, 'seed.txt'), 'host\n');
+      const r = spawnSync(
+        BOXSH,
+        ['--try', '-c', 'echo sandbox > seed.txt && cat seed.txt'],
+        { encoding: 'utf8', cwd, timeout: 10000 },
+      );
+      assert.equal(r.status, 0,
+        `--try failed: exit=${r.status}\nstderr: ${r.stderr}`);
+      assert.equal(r.stdout.trim(), 'sandbox');
+      // Host file must be untouched.
+      assert.equal(fs.readFileSync(path.join(cwd, 'seed.txt'), 'utf8'), 'host\n');
+    } finally {
+      spawnSync('rm', ['-rf', cwd]);
+    }
+  });
+
+  test('mixed: kernel overlayfs + fuse-overlayfs in same session', { skip: !hasFuseOverlayfs && 'fuse-overlayfs not installed' }, () => {
+    // Overlay A: lower on tmpfs (created inside sandbox via --tmpfs).
+    // We simulate this by using a lower dir whose inode < 2^31 — /etc is
+    // always on the root fs with a small inode.
+    //
+    // Overlay B: lower on XFS with large inode (TEMPDIR).
+    // This one will fail kernel overlayfs and fall back to fuse-overlayfs.
+    const dXfs = makeXfsDirs();
+    // Create a second overlay set also on XFS but with a tmpfs-based lower.
+    // We do this by creating a tmpfs --overlay where the lower is /usr/share/doc
+    // (small inode, kernel overlayfs should succeed).
+    const dSmall = fs.mkdtempSync(path.join(TEMPDIR, 'boxsh-mixed-'));
+    const smallLower = path.join(dSmall, 'lower');
+    const smallUpper = path.join(dSmall, 'upper');
+    const smallWork  = path.join(dSmall, 'work');
+    const smallDst   = path.join(dSmall, 'dst');
+    for (const d of [smallLower, smallUpper, smallWork, smallDst]) fs.mkdirSync(d);
+
+    try {
+      fs.writeFileSync(path.join(dXfs.lower, 'xfs.txt'), 'from-xfs\n');
+      fs.writeFileSync(path.join(smallLower, 'small.txt'), 'from-small\n');
+
+      const input = JSON.stringify({
+        id: '1',
+        cmd: `cat ${dXfs.dst}/xfs.txt && cat ${smallDst}/small.txt`,
+      }) + '\n';
+      const r = run(
+        [
+          '--rpc', '--workers', '1', '--sandbox',
+          '--overlay', `${dXfs.lower}:${dXfs.upper}:${dXfs.work}:${dXfs.dst}`,
+          '--overlay', `${smallLower}:${smallUpper}:${smallWork}:${smallDst}`,
+        ],
+        input,
+        10000,
+      );
+      assert.equal(r.signal, null, `boxsh killed by signal ${r.signal}`);
+      const line = r.stdout.trim();
+      assert.ok(line.length > 0, `no output; stderr: ${r.stderr}`);
+      const resp = JSON.parse(line);
+      assert.equal(resp.exit_code, 0, `cmd failed; stderr: ${resp.stderr}`);
+      assert.equal(resp.stdout, 'from-xfs\nfrom-small\n');
+    } finally {
+      dXfs.cleanup();
+      spawnSync('rm', ['-rf', dSmall]);
+    }
+  });
+});

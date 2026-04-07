@@ -5,19 +5,14 @@
 #include <cstdio>
 #include <cstdlib>
 
-#include <dirent.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <sched.h>
 #include <sys/mount.h>
 #include <sys/stat.h>
-#include <sys/statfs.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
-
-#ifndef XFS_SUPER_MAGIC
-#define XFS_SUPER_MAGIC 0x58465342
-#endif
+#include <sys/wait.h>
 
 namespace boxsh {
 
@@ -57,80 +52,94 @@ static int do_pivot_root(const char *new_root, const char *put_old) {
     return syscall(SYS_pivot_root, new_root, put_old);
 }
 
-// Returns true when the lower-layer filesystem requires directory pre-mirroring
-// to prevent EOVERFLOW during overlayfs directory copy-up in user namespaces.
-// XFS encodes file handles using inode numbers that may exceed the range
-// overlayfs can represent internally, causing copy-up to fail.  Pre-populating
-// upper with an empty directory skeleton avoids the copy-up entirely.
-static bool lower_needs_mirror_dirs(const std::string &lowerdir) {
-    // lowerdir may be a colon-separated list for multi-layer overlayfs.
-    // Copy-up originates from the topmost (first listed) lower layer.
-    std::string top = lowerdir;
-    size_t colon = lowerdir.find(':');
-    if (colon != std::string::npos)
-        top = lowerdir.substr(0, colon);
-
-    struct statfs sfs;
-    if (statfs(top.c_str(), &sfs) != 0)
-        return true; // fail-safe: mirror anyway
-    return sfs.f_type == XFS_SUPER_MAGIC;
-}
-
-// Recursively mirror the directory skeleton of 'src' into 'dst' (dirs only).
-static void mirror_dirs(const std::string &src, const std::string &dst) {
-    DIR *dir = opendir(src.c_str());
-    if (!dir) return;
-    struct dirent *ent;
-    while ((ent = readdir(dir)) != nullptr) {
-        if (ent->d_name[0] == '.' &&
-            (ent->d_name[1] == '\0' ||
-             (ent->d_name[1] == '.' && ent->d_name[2] == '\0')))
-            continue;
-        std::string src_child = src + "/" + ent->d_name;
-        std::string dst_child = dst + "/" + ent->d_name;
-        struct stat st;
-        if (lstat(src_child.c_str(), &st) != 0) continue;
-        if (!S_ISDIR(st.st_mode)) continue;
-        // Ignore errors: the directory may already exist.
-        mkdir(dst_child.c_str(), 0755);
-        mirror_dirs(src_child, dst_child);
+// Try to mount an overlay using fuse-overlayfs(1).  This is the fallback
+// when kernel overlayfs fails (e.g. XFS with large inodes in a user
+// namespace).  fuse-overlayfs runs entirely in userspace via FUSE and is
+// not affected by kernel-level file-handle encoding limitations.
+//
+// fuse-overlayfs daemonises itself by default.  We fork+exec and then
+// wait for the mount point to appear (poll the mount table).
+static bool try_fuse_overlayfs(const std::string &lowerdir,
+                                const std::string &dest,
+                                const std::string &upper,
+                                const std::string &work,
+                                std::string &err) {
+    // Check whether the binary is available before forking.
+    if (access("/usr/bin/fuse-overlayfs", X_OK) != 0 &&
+        access("/usr/local/bin/fuse-overlayfs", X_OK) != 0) {
+        err = "fuse-overlayfs not found; "
+              "install it with: apt install fuse-overlayfs";
+        return false;
     }
-    closedir(dir);
+
+    std::string opts = "lowerdir=" + lowerdir +
+                       ",upperdir=" + upper +
+                       ",workdir="  + work;
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        err = errno_str("fork for fuse-overlayfs");
+        return false;
+    }
+    if (pid == 0) {
+        // Child: exec fuse-overlayfs.
+        execlp("fuse-overlayfs", "fuse-overlayfs",
+               "-o", opts.c_str(), dest.c_str(), nullptr);
+        _exit(127);
+    }
+
+    // Parent: wait for the child to finish (fuse-overlayfs daemonises).
+    int status = 0;
+    if (waitpid(pid, &status, 0) < 0) {
+        err = errno_str("waitpid fuse-overlayfs");
+        return false;
+    }
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        err = "fuse-overlayfs exited with status " +
+              std::to_string(WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+        return false;
+    }
+    return true;
 }
 
 static bool mount_overlay_at(const std::string &lowerdir,
                                const std::string &dest,
                                const std::string &upper,
                                const std::string &work,
+                               const std::string & /*staging_base*/,
                                std::string &err) {
     if (!mkdir_p(dest, 0755, err)) return false;
-    // Pre-populate upper with the directory skeleton of lower only when the
-    // lower filesystem (XFS) cannot complete directory copy-up in a user
-    // namespace.  On other filesystems (tmpfs, ext4, …) copy-up works fine
-    // and we skip the potentially expensive pre-mirror step.
-    //
-    // For multi-layer lowerdirs (colon-separated) we mirror the topmost layer:
-    // that is the layer overlayfs uses as the source for directory copy-up.
-    if (lower_needs_mirror_dirs(lowerdir)) {
-        std::string top_lower = lowerdir;
-        size_t colon = lowerdir.find(':');
-        if (colon != std::string::npos)
-            top_lower = lowerdir.substr(0, colon);
-        mirror_dirs(top_lower, upper);
-    }
+
     // xino=off: disable cross-inode-number encoding between lower and upper
     // layers.  Without this, overlayfs copy-up fails with EOVERFLOW when the
-    // lower filesystem (e.g. ext4) has inode numbers that exceed the range
-    // the upper filesystem (e.g. tmpfs) can represent.
+    // lower filesystem has inode numbers that exceed the representable range.
     std::string opts = "lowerdir=" + lowerdir +
                        ",upperdir=" + upper +
                        ",workdir="  + work +
                        ",xino=off";
-    if (mount("overlay", dest.c_str(), "overlay", 0, opts.c_str()) != 0) {
+    if (mount("overlay", dest.c_str(), "overlay", 0, opts.c_str()) == 0)
+        return true;
+
+    // Only fall back to fuse-overlayfs for EINVAL, which is the specific
+    // error produced by XFS with large inodes in a user namespace ("failed
+    // to clone lowerpath").  Other errors (ENOENT, EPERM, …) indicate real
+    // configuration problems that fuse-overlayfs won't fix.
+    int saved_errno = errno;
+    if (saved_errno != EINVAL) {
         err = errno_str(("mount overlay -> " + dest).c_str());
         return false;
     }
-    return true;
+
+    std::fprintf(stderr,
+        "boxsh: kernel overlay mount failed (%s), trying fuse-overlayfs...\n",
+        std::strerror(saved_errno));
+
+    if (try_fuse_overlayfs(lowerdir, dest, upper, work, err))
+        return true;
+
+    // Both methods failed — report the fuse-overlayfs error which contains
+    // an actionable install hint.
+    return false;
 }
 
 // Apply overlay mounts inside new_root.  dest_prefix is the new root path.
@@ -193,7 +202,8 @@ static bool apply_overlay_mounts(const std::vector<OverlayMount> &overlays,
             }
         }
 
-        if (!mount_overlay_at(ov.lowerdir, dest, ov.upperdir, ov.workdir, err))
+        if (!mount_overlay_at(ov.lowerdir, dest, ov.upperdir, ov.workdir,
+                             dest_prefix, err))
             return false;
     }
     return true;
