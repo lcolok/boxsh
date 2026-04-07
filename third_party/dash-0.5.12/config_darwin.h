@@ -18,11 +18,18 @@
 
 /* macOS 10.15+ removed the *64 transitional aliases.  On Darwin all these
  * types and functions are semantically identical to their non-suffixed
- * counterparts (already 64-bit by default). */
+ * counterparts (already 64-bit by default).
+ *
+ * On x86_64 the SDK still provides stat64/lstat64/fstat64, so only
+ * redefine those on arm64.  The remaining *64 symbols (open64, dirent64,
+ * readdir64, glob64, globfree64) never existed on any macOS and must
+ * always be redirected. */
 #undef HAVE_ST_MTIM
+#ifdef __arm64__
 #define stat64     stat
 #define lstat64    lstat
 #define fstat64    fstat
+#endif
 #define open64     open
 #define dirent64   dirent
 #define readdir64  readdir

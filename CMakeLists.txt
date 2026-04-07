@@ -21,11 +21,21 @@ include(ExternalProject)
 set(LIBEDIT_SRC_DIR ${CMAKE_CURRENT_SOURCE_DIR}/third_party/libedit-20230828-3.1)
 set(LIBEDIT_PREFIX  ${CMAKE_CURRENT_BINARY_DIR}/libedit-prefix)
 
+# Propagate CMAKE_OSX_ARCHITECTURES to autotools-based libedit build
+if(CMAKE_OSX_ARCHITECTURES)
+    set(LIBEDIT_CONFIGURE_ENV ${CMAKE_COMMAND} -E env
+        "CFLAGS=-arch ${CMAKE_OSX_ARCHITECTURES}"
+        "LDFLAGS=-arch ${CMAKE_OSX_ARCHITECTURES}")
+else()
+    set(LIBEDIT_CONFIGURE_ENV)
+endif()
+
 ExternalProject_Add(libedit_ext
     SOURCE_DIR      ${LIBEDIT_SRC_DIR}
     BINARY_DIR      ${CMAKE_CURRENT_BINARY_DIR}/libedit-build
     PREFIX          ${LIBEDIT_PREFIX}
     CONFIGURE_COMMAND
+        ${LIBEDIT_CONFIGURE_ENV}
         ${LIBEDIT_SRC_DIR}/configure
             --prefix=${LIBEDIT_PREFIX}
             --enable-static
