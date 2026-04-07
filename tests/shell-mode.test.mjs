@@ -228,75 +228,64 @@ import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { BOXSH } from './helpers.mjs';
 
-/** Create lower/upper/work/dst dirs under a fresh temp base. */
-function makeOverlayDirs() {
+/** Create src/dst dirs under a fresh temp base for COW testing. */
+function makeCowDirs() {
   const base = fs.mkdtempSync(path.join(os.tmpdir(), 'boxsh-sm-'));
-  const lower = path.join(base, 'lower');
-  const upper = path.join(base, 'upper');
-  const work  = path.join(base, 'work');
-  const dst   = path.join(base, 'dst');
-  fs.mkdirSync(lower); fs.mkdirSync(upper);
-  fs.mkdirSync(work);  fs.mkdirSync(dst);
+  const src  = path.join(base, 'src');
+  const dst  = path.join(base, 'dst');
+  fs.mkdirSync(src); fs.mkdirSync(dst);
   return {
-    lower, upper, work, dst,
+    src, dst,
     cleanup: () => spawnSync('rm', ['-rf', base]),
   };
 }
 
 describe('shell mode — sandbox', () => {
-  test('--sandbox --overlay: lower-layer file visible via -c', () => {
-    const { lower, upper, work, dst, cleanup } = makeOverlayDirs();
+  test('--sandbox --bind cow: src-layer file visible via -c', () => {
+    const { src, dst, cleanup } = makeCowDirs();
     try {
-      fs.writeFileSync(path.join(lower, 'hello.txt'), 'from-lower\n');
+      fs.writeFileSync(path.join(src, 'hello.txt'), 'from-src\n');
       const r = run(
-        ['--sandbox', '--overlay', `${lower}:${upper}:${work}:${dst}`,
+        ['--sandbox', '--bind', `cow:${src}:${dst}`,
          '-c', `cat ${dst}/hello.txt`],
       );
       assert.equal(r.status, 0);
-      assert.equal(r.stdout, 'from-lower\n');
+      assert.equal(r.stdout, 'from-src\n');
     } finally {
       cleanup();
     }
   });
 
-  test('--sandbox --overlay: write goes to upper, lower unchanged', () => {
-    const { lower, upper, work, dst, cleanup } = makeOverlayDirs();
+  test('--sandbox --bind cow: write goes to dst, src unchanged', () => {
+    const { src, dst, cleanup } = makeCowDirs();
     try {
-      fs.writeFileSync(path.join(lower, 'base.txt'), 'original\n');
+      fs.writeFileSync(path.join(src, 'base.txt'), 'original\n');
       const r = run(
-        ['--sandbox', '--overlay', `${lower}:${upper}:${work}:${dst}`,
+        ['--sandbox', '--bind', `cow:${src}:${dst}`,
          '-c', `echo modified > ${dst}/base.txt`],
       );
       assert.equal(r.status, 0);
-      assert.equal(fs.readFileSync(path.join(lower, 'base.txt'), 'utf8'), 'original\n');
-      assert.equal(fs.readFileSync(path.join(upper, 'base.txt'), 'utf8'), 'modified\n');
+      assert.equal(fs.readFileSync(path.join(src, 'base.txt'), 'utf8'), 'original\n');
+      assert.equal(fs.readFileSync(path.join(dst, 'base.txt'), 'utf8'), 'modified\n');
     } finally {
       cleanup();
     }
   });
 
-  test('--sandbox --overlay: delete hides file inside sandbox, lower unchanged', () => {
-    const { lower, upper, work, dst, cleanup } = makeOverlayDirs();
+  test('--sandbox --bind cow: delete hides file inside sandbox, src unchanged', () => {
+    const { src, dst, cleanup } = makeCowDirs();
     try {
-      fs.writeFileSync(path.join(lower, 'victim.txt'), 'delete-me\n');
+      fs.writeFileSync(path.join(src, 'victim.txt'), 'delete-me\n');
       const r = run(
-        ['--sandbox', '--overlay', `${lower}:${upper}:${work}:${dst}`,
+        ['--sandbox', '--bind', `cow:${src}:${dst}`,
          '-c', `rm ${dst}/victim.txt && [ ! -e ${dst}/victim.txt ] && echo gone`],
       );
       assert.equal(r.status, 0);
       assert.equal(r.stdout, 'gone\n');
-      assert.equal(fs.readFileSync(path.join(lower, 'victim.txt'), 'utf8'), 'delete-me\n');
+      assert.equal(fs.readFileSync(path.join(src, 'victim.txt'), 'utf8'), 'delete-me\n');
     } finally {
       cleanup();
     }
-  });
-
-  test('--sandbox --tmpfs: mount is writable', () => {
-    const r = run(
-      ['--sandbox', '--tmpfs', '/tmp', '-c', 'echo ok > /tmp/x && cat /tmp/x'],
-    );
-    assert.equal(r.status, 0);
-    assert.equal(r.stdout, 'ok\n');
   });
 });
 

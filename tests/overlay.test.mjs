@@ -1,8 +1,8 @@
 /**
- * overlay.test.mjs — tests for --overlay, --proc, --tmpfs sandbox mounts.
+ * overlay.test.mjs — tests for --bind cow:SRC:DST sandbox COW mounts.
  *
- * Overlay tests use RPC mode (--sandbox is applied per worker at fork time).
- * Each test creates its own lower/upper/work/dst directories and cleans up.
+ * COW tests use RPC mode (--sandbox is applied per worker at fork time).
+ * Each test creates its own src/dst directories and cleans up.
  */
 
 import { test, describe } from 'node:test';
@@ -17,21 +17,17 @@ import { run, BOXSH, TEMPDIR } from './helpers.mjs';
 // Helpers
 // ---------------------------------------------------------------------------
 
-/** Create a temp dir subtree for overlay testing. */
-function makeOverlayDirs() {
-  const base = fs.mkdtempSync(path.join(TEMPDIR, 'boxsh-ovl-'));
-  const lower = path.join(base, 'lower');
-  const upper = path.join(base, 'upper');
-  const work  = path.join(base, 'work');
-  const dst   = path.join(base, 'dst');
-  fs.mkdirSync(lower);
-  fs.mkdirSync(upper);
-  fs.mkdirSync(work);
+/** Create a temp dir subtree for COW testing (src = lower, dst = upper+merge). */
+function makeCowDirs() {
+  const base = fs.mkdtempSync(path.join(TEMPDIR, 'boxsh-cow-'));
+  const src  = path.join(base, 'src');
+  const dst  = path.join(base, 'dst');
+  fs.mkdirSync(src);
   fs.mkdirSync(dst);
   return {
-    lower, upper, work, dst,
-    // Use the shell rm -rf: overlayfs leaves kernel-internal entries in
-    // the work directory that Node's fs.rmSync cannot always remove.
+    src, dst,
+    // Use the shell rm -rf: overlayfs leaves kernel-internal entries in the
+    // auto-created work directory that Node's fs.rmSync cannot always remove.
     cleanup: () => spawnSync('rm', ['-rf', base]),
   };
 }
@@ -53,121 +49,114 @@ function rpcWith(extraFlags, cmd, timeout_ms = 5000) {
   return JSON.parse(line);
 }
 
+/** Convenience: run with a single --bind cow:SRC:DST flag. */
+function rpcCow(src, dst, cmd, timeout_ms = 5000) {
+  return rpcWith(['--bind', `cow:${src}:${dst}`], cmd, timeout_ms);
+}
+
 // ---------------------------------------------------------------------------
-// --overlay LOWER:UPPER:WORK:DST
+// --bind cow:SRC:DST
 // ---------------------------------------------------------------------------
 
-describe('sandbox — overlay mounts', () => {
-  test('lower-layer files are visible at the mount point', () => {
-    const { lower, upper, work, dst, cleanup } = makeOverlayDirs();
+describe('sandbox — cow mounts', () => {
+  test('src-layer files are visible at the dst mount point', () => {
+    const { src, dst, cleanup } = makeCowDirs();
     try {
-      fs.writeFileSync(path.join(lower, 'hello.txt'), 'from-lower\n');
-      const resp = rpcWith(
-        ['--overlay', `${lower}:${upper}:${work}:${dst}`],
-        `cat ${dst}/hello.txt`,
-      );
+      fs.writeFileSync(path.join(src, 'hello.txt'), 'from-src\n');
+      const resp = rpcCow(src, dst, `cat ${dst}/hello.txt`);
       assert.equal(resp.exit_code, 0);
-      assert.equal(resp.stdout, 'from-lower\n');
+      assert.equal(resp.stdout, 'from-src\n');
     } finally {
       cleanup();
     }
   });
 
-  test('writes go to upper layer; lower is unchanged (copy-on-write)', () => {
-    const { lower, upper, work, dst, cleanup } = makeOverlayDirs();
+  test('writes go to dst; src is unchanged (copy-on-write)', () => {
+    const { src, dst, cleanup } = makeCowDirs();
     try {
-      fs.writeFileSync(path.join(lower, 'base.txt'), 'original\n');
-      const resp = rpcWith(
-        ['--overlay', `${lower}:${upper}:${work}:${dst}`],
+      fs.writeFileSync(path.join(src, 'base.txt'), 'original\n');
+      const resp = rpcCow(src, dst,
         // Redirect overwrites the file through the overlay.
         `echo modified > ${dst}/base.txt`,
       );
       assert.equal(resp.exit_code, 0);
-      // Lower layer must not change.
+      // src must not change.
       assert.equal(
-        fs.readFileSync(path.join(lower, 'base.txt'), 'utf8'), 'original\n',
+        fs.readFileSync(path.join(src, 'base.txt'), 'utf8'), 'original\n',
       );
-      // Modified copy appears in upper layer (host-visible).
+      // Modified copy captured in dst (upper layer, host-visible).
       assert.equal(
-        fs.readFileSync(path.join(upper, 'base.txt'), 'utf8'), 'modified\n',
+        fs.readFileSync(path.join(dst, 'base.txt'), 'utf8'), 'modified\n',
       );
     } finally {
       cleanup();
     }
   });
 
-  test('new files created inside sandbox appear in upper layer', () => {
-    const { lower, upper, work, dst, cleanup } = makeOverlayDirs();
+  test('new files created inside sandbox appear in dst', () => {
+    const { src, dst, cleanup } = makeCowDirs();
     try {
-      const resp = rpcWith(
-        ['--overlay', `${lower}:${upper}:${work}:${dst}`],
-        `echo fresh > ${dst}/created.txt`,
-      );
+      const resp = rpcCow(src, dst, `echo fresh > ${dst}/created.txt`);
       assert.equal(resp.exit_code, 0);
       assert.equal(
-        fs.readFileSync(path.join(upper, 'created.txt'), 'utf8'), 'fresh\n',
+        fs.readFileSync(path.join(dst, 'created.txt'), 'utf8'), 'fresh\n',
       );
     } finally {
       cleanup();
     }
   });
 
-  test('lower layer read-only: writes are not reflected in lower', () => {
-    const { lower, upper, work, dst, cleanup } = makeOverlayDirs();
+  test('src is read-only: writes are not reflected in src', () => {
+    const { src, dst, cleanup } = makeCowDirs();
     try {
-      // Write a new file through the overlay mount.
-      rpcWith(
-        ['--overlay', `${lower}:${upper}:${work}:${dst}`],
-        `echo data > ${dst}/newfile.txt`,
-      );
-      // The lower layer must remain empty.
-      assert.deepEqual(fs.readdirSync(lower), []);
+      // Write a new file through the COW mount.
+      rpcCow(src, dst, `echo data > ${dst}/newfile.txt`);
+      // The src directory must remain empty.
+      assert.deepEqual(fs.readdirSync(src), []);
     } finally {
       cleanup();
     }
   });
 
-  test('invalid --overlay format is rejected (exit 1)', () => {
-    // Only two fields provided instead of four.
-    const r = run(['--rpc', '--sandbox', '--overlay', 'only:two'], '');
+  test('invalid --bind cow format is rejected (exit 1)', () => {
+    // cow: requires both SRC and DST; only one path provided.
+    const r = run(['--rpc', '--sandbox', '--bind', 'cow:only-one-path'], '');
     assert.equal(r.status, 1);
   });
 
-  test('deleting a lower-layer file hides it inside sandbox, lower unchanged', () => {
-    const { lower, upper, work, dst, cleanup } = makeOverlayDirs();
+  test('deleting a src-layer file hides it inside sandbox, src unchanged', () => {
+    const { src, dst, cleanup } = makeCowDirs();
     try {
-      fs.writeFileSync(path.join(lower, 'victim.txt'), 'delete-me\n');
+      fs.writeFileSync(path.join(src, 'victim.txt'), 'delete-me\n');
       // rm inside the sandbox should succeed.
-      const resp = rpcWith(
-        ['--overlay', `${lower}:${upper}:${work}:${dst}`],
+      const resp = rpcCow(src, dst,
         `rm ${dst}/victim.txt && [ ! -e ${dst}/victim.txt ] && echo gone`,
       );
       assert.equal(resp.exit_code, 0);
       assert.equal(resp.stdout, 'gone\n');
-      // Lower layer must still have the original file.
+      // src must still have the original file.
       assert.equal(
-        fs.readFileSync(path.join(lower, 'victim.txt'), 'utf8'), 'delete-me\n',
+        fs.readFileSync(path.join(src, 'victim.txt'), 'utf8'), 'delete-me\n',
       );
     } finally {
       cleanup();
     }
   });
 
-  test('deleting a lower-layer file leaves a whiteout entry in upper', () => {
-    const { lower, upper, work, dst, cleanup } = makeOverlayDirs();
+  test('deleting a src-layer file leaves a whiteout entry in dst',
+    { skip: process.platform === 'darwin' ? 'clonefile COW does not create overlayfs-style whiteout entries' : false },
+    () => {
+    const { src, dst, cleanup } = makeCowDirs();
     try {
-      fs.writeFileSync(path.join(lower, 'ghost.txt'), 'ghost\n');
-      rpcWith(
-        ['--overlay', `${lower}:${upper}:${work}:${dst}`],
-        `rm ${dst}/ghost.txt`,
-      );
-      // Overlayfs records deletion as a char-device whiteout (0,0) in upper.
-      const upperEntries = fs.readdirSync(upper);
+      fs.writeFileSync(path.join(src, 'ghost.txt'), 'ghost\n');
+      rpcCow(src, dst, `rm ${dst}/ghost.txt`);
+      // Overlayfs records deletion as a char-device whiteout (0,0) in dst (upper).
+      const dstEntries = fs.readdirSync(dst);
       assert.ok(
-        upperEntries.includes('ghost.txt'),
-        `expected whiteout for ghost.txt in upper, got: [${upperEntries}]`,
+        dstEntries.includes('ghost.txt'),
+        `expected whiteout for ghost.txt in dst, got: [${dstEntries}]`,
       );
-      const stat = fs.statSync(path.join(upper, 'ghost.txt'));
+      const stat = fs.statSync(path.join(dst, 'ghost.txt'));
       // Whiteout = character device with rdev 0.
       assert.ok(stat.isCharacterDevice(), 'whiteout must be a character device');
       assert.equal(stat.rdev, 0, 'whiteout rdev must be 0');
@@ -178,78 +167,73 @@ describe('sandbox — overlay mounts', () => {
 });
 
 // ---------------------------------------------------------------------------
-// CWD inside the overlay mount point
+// CWD inside the COW src directory
 //
-// When the overlay mount point equals or contains the process CWD, the
-// kernel's stored (dentry, vfsmount) pair for CWD still points at the lower
-// layer after mount().  sandbox_apply() refreshes CWD via chdir() so that
+// When the process CWD is within the COW src, sandbox_apply() redirects CWD
+// to the corresponding path under dst (the overlay merge point) so that
 // relative-path writes go through the overlay instead of bypassing it.
 // ---------------------------------------------------------------------------
 
-describe('sandbox — overlay CWD refresh', () => {
-  test('relative write captured in upper when CWD == mount point', () => {
-    // Set up: lower has one existing file; we write a new file via relative path.
-    const { lower, upper, work, dst, cleanup } = makeOverlayDirs();
+describe('sandbox — cow CWD redirect', () => {
+  test('relative write captured in dst when CWD == src', () => {
+    // Launch with CWD = src; sandbox redirects CWD to dst.
+    const { src, dst, cleanup } = makeCowDirs();
     try {
-      // dst is the overlay mount point.  Run boxsh with dst as CWD so that
-      // the relative path 'touch newfile' exercises the CWD == mount case.
       const r = spawnSync(
         BOXSH,
-        ['--sandbox', '--overlay', `${lower}:${upper}:${work}:${dst}`, '-c', 'touch newfile'],
-        { encoding: 'utf8', cwd: dst, timeout: 5000 },
+        ['--sandbox', '--bind', `cow:${src}:${dst}`, '-c', 'touch newfile'],
+        { encoding: 'utf8', cwd: src, timeout: 5000 },
       );
       assert.equal(r.status, 0, `boxsh failed: ${r.stderr}`);
-      // Write must appear in upper, not bypass to lower.
-      assert.ok(fs.existsSync(path.join(upper, 'newfile')),
-        'expected newfile in upper layer');
-      assert.ok(!fs.existsSync(path.join(lower, 'newfile')),
-        'newfile must not appear in lower layer');
+      // Write must appear in dst (upper layer), not in src (lower layer).
+      assert.ok(fs.existsSync(path.join(dst, 'newfile')),
+        'expected newfile in dst (upper layer)');
+      assert.ok(!fs.existsSync(path.join(src, 'newfile')),
+        'newfile must not appear in src (lower layer)');
     } finally {
       cleanup();
     }
   });
 
-  test('relative write captured in upper when CWD is subdirectory of mount point', () => {
-    const { lower, upper, work, dst, cleanup } = makeOverlayDirs();
+  test('relative write captured in dst when CWD is subdirectory of src', () => {
+    const { src, dst, cleanup } = makeCowDirs();
     try {
-      // Create a subdirectory in lower so the overlay exposes it under dst.
-      fs.mkdirSync(path.join(lower, 'subdir'));
-      // Launch boxsh with dst as CWD; let the shell cd into the subdir so
-      // that the relative write happens with CWD = dst/subdir (inside the
-      // overlay mount tree).
+      // Create a subdirectory in src so the overlay exposes it under dst.
+      fs.mkdirSync(path.join(src, 'subdir'));
+      // Launch with CWD = src; shell cd into subdir (via dst overlay).
       const r = spawnSync(
         BOXSH,
-        ['--sandbox', '--overlay', `${lower}:${upper}:${work}:${dst}`,
+        ['--sandbox', '--bind', `cow:${src}:${dst}`,
          '-c', `cd ${dst}/subdir && touch canary`],
-        { encoding: 'utf8', cwd: dst, timeout: 5000 },
+        { encoding: 'utf8', cwd: src, timeout: 5000 },
       );
       assert.equal(r.status, 0, `boxsh failed: ${r.stderr}`);
-      // The file should be captured in upper/subdir, not escape to lower/subdir.
-      assert.ok(fs.existsSync(path.join(upper, 'subdir', 'canary')),
-        'expected canary in upper/subdir');
-      assert.ok(!fs.existsSync(path.join(lower, 'subdir', 'canary')),
-        'canary must not appear in lower/subdir');
+      // File must be in dst/subdir (upper), not src/subdir (lower).
+      assert.ok(fs.existsSync(path.join(dst, 'subdir', 'canary')),
+        'expected canary in dst/subdir');
+      assert.ok(!fs.existsSync(path.join(src, 'subdir', 'canary')),
+        'canary must not appear in src/subdir');
     } finally {
       cleanup();
     }
   });
 
-  test('CWD outside mount point is unaffected', () => {
-    // Sanity check: when CWD is not under the overlay, normal writes still work.
-    const { lower, upper, work, dst, cleanup } = makeOverlayDirs();
+  test('CWD outside src is unaffected', () => {
+    // When CWD is not under src, the auto-bind of CWD handles it normally.
+    const { src, dst, cleanup } = makeCowDirs();
     const outsideDir = fs.mkdtempSync(path.join(TEMPDIR, 'boxsh-outside-'));
     try {
       const r = spawnSync(
         BOXSH,
-        ['--sandbox', '--overlay', `${lower}:${upper}:${work}:${dst}`, '-c', 'touch outside-file'],
+        ['--sandbox', '--bind', `cow:${src}:${dst}`, '-c', 'touch outside-file'],
         { encoding: 'utf8', cwd: outsideDir, timeout: 5000 },
       );
       assert.equal(r.status, 0, `boxsh failed: ${r.stderr}`);
-      // File written relative to outsideDir is visible there (not via overlay).
+      // File written relative to outsideDir is visible there.
       assert.ok(fs.existsSync(path.join(outsideDir, 'outside-file')),
         'expected outside-file to exist in outsideDir');
-      // upper must remain empty (no write went through overlay).
-      assert.deepEqual(fs.readdirSync(upper), []);
+      // dst must remain empty (no write went through the overlay).
+      assert.deepEqual(fs.readdirSync(dst), []);
     } finally {
       cleanup();
       spawnSync('rm', ['-rf', outsideDir]);
@@ -258,384 +242,7 @@ describe('sandbox — overlay CWD refresh', () => {
 });
 
 // ---------------------------------------------------------------------------
-// Multi-layer lower (session branching)
-//
-// overlayfs supports multiple lower directories separated by colons.
-// This is the foundation for session checkpointing and branching:
-//
-//   session A: --overlay base:upper_a:work_a:dst
-//   branch A1: --overlay upper_a:base:upper_a1:work_a1:dst
-//   branch B:  --overlay upper_a:base:upper_b:work_b:dst
-//
-// Both branches see upper_a's modifications merged on top of base, but
-// new writes go to their own upper directories.
-// ---------------------------------------------------------------------------
-
-describe('sandbox — multi-layer overlay (session branching)', () => {
-  /** Create a deeper temp dir tree for multi-layer tests. */
-  function makeMultiLayerDirs() {
-    const root = fs.mkdtempSync(path.join(TEMPDIR, 'boxsh-ml-'));
-    const dirs = {};
-    for (const name of ['base', 'upper_a', 'work_a', 'upper_a1', 'work_a1', 'upper_b', 'work_b', 'dst']) {
-      dirs[name] = path.join(root, name);
-      fs.mkdirSync(dirs[name]);
-    }
-    dirs.cleanup = () => spawnSync('rm', ['-rf', root]);
-    return dirs;
-  }
-
-  test('branch sees both base and upper_a files merged', () => {
-    const d = makeMultiLayerDirs();
-    try {
-      // base has one file, upper_a has another
-      fs.writeFileSync(path.join(d.base,    'from-base.txt'),    'base\n');
-      fs.writeFileSync(path.join(d.upper_a, 'from-session.txt'), 'session-a\n');
-
-      // Branch A1: lower = upper_a:base (upper_a on top of base)
-      const resp = rpcWith(
-        ['--overlay', `${d.upper_a}:${d.base}:${d.upper_a1}:${d.work_a1}:${d.dst}`],
-        `cat ${d.dst}/from-base.txt && cat ${d.dst}/from-session.txt`,
-      );
-      assert.equal(resp.exit_code, 0);
-      assert.equal(resp.stdout, 'base\nsession-a\n');
-    } finally {
-      d.cleanup();
-    }
-  });
-
-  test('upper_a modifications override base in branch', () => {
-    const d = makeMultiLayerDirs();
-    try {
-      // Same file in both layers — upper_a should win
-      fs.writeFileSync(path.join(d.base,    'config.txt'), 'original\n');
-      fs.writeFileSync(path.join(d.upper_a, 'config.txt'), 'modified-by-a\n');
-
-      const resp = rpcWith(
-        ['--overlay', `${d.upper_a}:${d.base}:${d.upper_a1}:${d.work_a1}:${d.dst}`],
-        `cat ${d.dst}/config.txt`,
-      );
-      assert.equal(resp.exit_code, 0);
-      assert.equal(resp.stdout, 'modified-by-a\n');
-    } finally {
-      d.cleanup();
-    }
-  });
-
-  test('branch writes go to new upper, not to upper_a or base', () => {
-    const d = makeMultiLayerDirs();
-    try {
-      fs.writeFileSync(path.join(d.base, 'readme.txt'), 'hello\n');
-
-      const resp = rpcWith(
-        ['--overlay', `${d.upper_a}:${d.base}:${d.upper_a1}:${d.work_a1}:${d.dst}`],
-        `echo branch-write > ${d.dst}/new.txt`,
-      );
-      assert.equal(resp.exit_code, 0);
-
-      // New file appears only in upper_a1
-      assert.equal(
-        fs.readFileSync(path.join(d.upper_a1, 'new.txt'), 'utf8'),
-        'branch-write\n',
-      );
-      // base and upper_a are untouched
-      assert.ok(!fs.existsSync(path.join(d.base,    'new.txt')));
-      assert.ok(!fs.existsSync(path.join(d.upper_a, 'new.txt')));
-    } finally {
-      d.cleanup();
-    }
-  });
-
-  test('two branches from same parent diverge independently', () => {
-    const d = makeMultiLayerDirs();
-    try {
-      fs.writeFileSync(path.join(d.base, 'shared.txt'), 'base\n');
-      fs.writeFileSync(path.join(d.upper_a, 'shared.txt'), 'session-a\n');
-
-      // Branch A1 writes one thing
-      const r1 = rpcWith(
-        ['--overlay', `${d.upper_a}:${d.base}:${d.upper_a1}:${d.work_a1}:${d.dst}`],
-        `echo a1 > ${d.dst}/branch.txt && cat ${d.dst}/shared.txt`,
-      );
-      assert.equal(r1.exit_code, 0);
-      assert.equal(r1.stdout, 'session-a\n');
-
-      // Branch B writes something different
-      const r2 = rpcWith(
-        ['--overlay', `${d.upper_a}:${d.base}:${d.upper_b}:${d.work_b}:${d.dst}`],
-        `echo b > ${d.dst}/branch.txt && cat ${d.dst}/shared.txt`,
-      );
-      assert.equal(r2.exit_code, 0);
-      assert.equal(r2.stdout, 'session-a\n');
-
-      // Each branch has its own version of branch.txt
-      assert.equal(fs.readFileSync(path.join(d.upper_a1, 'branch.txt'), 'utf8'), 'a1\n');
-      assert.equal(fs.readFileSync(path.join(d.upper_b,  'branch.txt'), 'utf8'), 'b\n');
-
-      // upper_a is completely untouched
-      assert.ok(!fs.existsSync(path.join(d.upper_a, 'branch.txt')));
-    } finally {
-      d.cleanup();
-    }
-  });
-});
-
-// ---------------------------------------------------------------------------
-// --tmpfs DST[:OPTS]
-// ---------------------------------------------------------------------------
-
-describe('sandbox — tmpfs mounts', () => {
-  test('tmpfs is writable (/tmp shadowed by fresh tmpfs)', () => {
-    // Mount a fresh tmpfs over /tmp — safe in the private mount namespace.
-    const resp = rpcWith(
-      ['--tmpfs', '/tmp'],
-      'echo hello > /tmp/test.txt && cat /tmp/test.txt',
-    );
-    assert.equal(resp.exit_code, 0);
-    assert.equal(resp.stdout, 'hello\n');
-  });
-
-  test('tmpfs with size option mounts successfully', () => {
-    const resp = rpcWith(
-      ['--tmpfs', '/tmp:size=16m'],
-      'echo sized > /tmp/f && cat /tmp/f',
-    );
-    assert.equal(resp.exit_code, 0);
-    assert.equal(resp.stdout, 'sized\n');
-  });
-});
-
-// ---------------------------------------------------------------------------
-// Lower-layer mutation after mount
-//
-// overlayfs does NOT snapshot the lower directory — it is a live view.
-// Whether a newly added lower-layer file is visible within the SAME mounted
-// instance depends on kernel dentry caching:
-//
-//   • If a process previously did a stat/access check for the file (creating
-//     a *negative* dentry — "this file does not exist"), the kernel caches
-//     that result and the new file remains invisible until the cache expires.
-//
-//   • If no such check was made (e.g. only a directory listing was done),
-//     the new file IS visible immediately.
-//
-// A NEW sandbox session (fresh overlay mount) always sees the current state
-// of the lower directory, regardless of negative dentries.
-// ---------------------------------------------------------------------------
-
-describe('sandbox — overlay lower-layer mutation after mount', () => {
-  test('new lower file visible in same session when no negative dentry cached', async () => {
-    // Request 1 lists the directory (no negative dentry for late.txt is created).
-    // The host then adds late.txt to lower.
-    // Request 2 should see it because the dentry cache has no negative entry.
-    const { lower, upper, work, dst, cleanup } = makeOverlayDirs();
-    try {
-      const proc = spawn(BOXSH, [
-        '--rpc', '--workers', '1', '--sandbox',
-        '--overlay', `${lower}:${upper}:${work}:${dst}`,
-      ]);
-
-      const responses = [];
-      const rl = createInterface({ input: proc.stdout });
-      rl.on('line', l => { if (l.trim()) responses.push(JSON.parse(l)); });
-
-      const waitFor = (n) => new Promise(resolve => {
-        const check = () => { if (responses.length >= n) resolve(); else setTimeout(check, 20); };
-        check();
-      });
-
-      // Request 1: list the directory (does NOT create a negative dentry).
-      proc.stdin.write(JSON.stringify({ id: '1', cmd: `ls ${dst}; echo listed` }) + '\n');
-      await waitFor(1);
-
-      // Host adds a file to lower while the overlay is still mounted.
-      fs.writeFileSync(path.join(lower, 'late.txt'), 'appeared\n');
-
-      // Request 2: the new file should be visible (no negative dentry blocking it).
-      proc.stdin.write(JSON.stringify({ id: '2', cmd: `cat ${dst}/late.txt` }) + '\n');
-      proc.stdin.end();
-      await waitFor(2);
-
-      assert.equal(responses[0].exit_code, 0);
-      assert.equal(responses[1].exit_code, 0, 'newly added lower file should be visible when no negative dentry was cached');
-      assert.equal(responses[1].stdout, 'appeared\n');
-    } finally {
-      cleanup();
-    }
-  });
-
-  test('negative dentry hides new lower file within same session', async () => {
-    // Request 1 checks whether late.txt exists ([ ! -e ... ]), which causes
-    // the kernel to cache a negative dentry ("late.txt does not exist").
-    // Even after the host adds the file to lower, the same session cannot
-    // see it because cat hits the cached negative dentry.
-    const { lower, upper, work, dst, cleanup } = makeOverlayDirs();
-    try {
-      const proc = spawn(BOXSH, [
-        '--rpc', '--workers', '1', '--sandbox',
-        '--overlay', `${lower}:${upper}:${work}:${dst}`,
-      ]);
-
-      const responses = [];
-      const rl = createInterface({ input: proc.stdout });
-      rl.on('line', l => { if (l.trim()) responses.push(JSON.parse(l)); });
-
-      const waitFor = (n) => new Promise(resolve => {
-        const check = () => { if (responses.length >= n) resolve(); else setTimeout(check, 20); };
-        check();
-      });
-
-      // Request 1: access a non-existent path, creating a negative dentry.
-      proc.stdin.write(JSON.stringify({ id: '1', cmd: `[ ! -e ${dst}/late.txt ] && echo absent` }) + '\n');
-      await waitFor(1);
-
-      // Host adds the file to lower.
-      fs.writeFileSync(path.join(lower, 'late.txt'), 'appeared\n');
-
-      // Request 2: the cached negative dentry makes the file invisible.
-      proc.stdin.write(JSON.stringify({ id: '2', cmd: `cat ${dst}/late.txt` }) + '\n');
-      proc.stdin.end();
-      await waitFor(2);
-
-      assert.equal(responses[0].exit_code, 0);
-      assert.equal(responses[1].exit_code, 1,
-        'negative dentry should hide the new lower file within the same mounted session');
-    } finally {
-      cleanup();
-    }
-  });
-
-  test('host modifies a lower file that has NOT been copied up — new session sees new content', () => {
-    const { lower, upper, work, dst, cleanup } = makeOverlayDirs();
-    try {
-      fs.writeFileSync(path.join(lower, 'mutable.txt'), 'v1\n');
-      // Confirm v1 is visible (no copy-up yet).
-      const r1 = rpcWith(
-        ['--overlay', `${lower}:${upper}:${work}:${dst}`],
-        `cat ${dst}/mutable.txt`,
-      );
-      assert.equal(r1.stdout, 'v1\n');
-      assert.deepEqual(fs.readdirSync(upper), [], 'upper must still be empty — no copy-up');
-
-      // Host updates lower directly (simulates upstream commit).
-      fs.writeFileSync(path.join(lower, 'mutable.txt'), 'v2\n');
-
-      // New sandbox invocation using the same lower/upper/work: sees v2.
-      const r2 = rpcWith(
-        ['--overlay', `${lower}:${upper}:${work}:${dst}`],
-        `cat ${dst}/mutable.txt`,
-      );
-      assert.equal(r2.stdout, 'v2\n',
-        'lower mutation visible in new sandbox session when file was not copied up');
-    } finally {
-      cleanup();
-    }
-  });
-
-  test('host modifies a lower file that HAS been copied up — sandbox keeps its own upper copy', () => {
-    const { lower, upper, work, dst, cleanup } = makeOverlayDirs();
-    try {
-      fs.writeFileSync(path.join(lower, 'owned.txt'), 'lower-original\n');
-      // First session: sandbox writes to the file, triggering copy-up.
-      const r1 = rpcWith(
-        ['--overlay', `${lower}:${upper}:${work}:${dst}`],
-        `echo sandbox-edit > ${dst}/owned.txt`,
-      );
-      assert.equal(r1.exit_code, 0);
-      // Confirm copy-up happened.
-      assert.ok(fs.existsSync(path.join(upper, 'owned.txt')), 'copy-up must have occurred');
-
-      // Host now modifies lower (simulates upstream diverging).
-      fs.writeFileSync(path.join(lower, 'owned.txt'), 'lower-updated\n');
-
-      // Second session reuses the same upper: should see the upper copy, not lower.
-      const r2 = rpcWith(
-        ['--overlay', `${lower}:${upper}:${work}:${dst}`],
-        `cat ${dst}/owned.txt`,
-      );
-      assert.equal(r2.stdout, 'sandbox-edit\n',
-        'after copy-up, lower mutation must NOT override the upper copy');
-    } finally {
-      cleanup();
-    }
-  });
-});
-
-// ---------------------------------------------------------------------------
-// Overlay lower-layer isolation
-//
-// The lower, upper, and work directories are implementation details of the
-// overlay setup — they must not be directly accessible by their host paths
-// inside the sandbox.  Only the DST (overlay mount point) is visible.
-// ---------------------------------------------------------------------------
-
-describe('sandbox — overlay lower-layer isolation', () => {
-  test('lower directory is not accessible by host path inside sandbox', () => {
-    const { lower, upper, work, dst, cleanup } = makeOverlayDirs();
-    fs.writeFileSync(path.join(lower, 'secret.txt'), 'lower-secret\n');
-    try {
-      // lower lives in host /tmp; sandbox /tmp is fresh, so lower/ does not exist.
-      const notVisible = rpcWith(
-        ['--overlay', `${lower}:${upper}:${work}:${dst}`],
-        `cat "${lower}/secret.txt" 2>&1; echo exit:$?`,
-      );
-      assert.equal(notVisible.exit_code, 0, 'shell itself must exit 0');
-      assert.ok(
-        notVisible.stdout.includes('No such file') || notVisible.stdout.includes('exit:1'),
-        `expected lower to be inaccessible inside sandbox, got: ${notVisible.stdout}`,
-      );
-      // The same file IS readable via the overlay DST.
-      const viaOverlay = rpcWith(
-        ['--overlay', `${lower}:${upper}:${work}:${dst}`],
-        `cat "${dst}/secret.txt"`,
-      );
-      assert.equal(viaOverlay.exit_code, 0);
-      assert.equal(viaOverlay.stdout, 'lower-secret\n');
-    } finally {
-      cleanup();
-    }
-  });
-
-  test('upper and work directories are not accessible inside sandbox', () => {
-    const { lower, upper, work, dst, cleanup } = makeOverlayDirs();
-    try {
-      // upper and work are siblings of dst under /tmp/boxsh-ovl-XXX/ which
-      // does exist as a directory in the sandbox (created by mkdir_p), but
-      // the upper/ and work/ subdirectories were never created there.
-      const resp = rpcWith(
-        ['--overlay', `${lower}:${upper}:${work}:${dst}`],
-        `[ -d "${upper}" ] && echo accessible || echo inaccessible`,
-      );
-      assert.equal(resp.exit_code, 0);
-      assert.equal(resp.stdout.trim(), 'inaccessible',
-        'upper directory must not be accessible inside sandbox');
-    } finally {
-      cleanup();
-    }
-  });
-
-  test('writing inside sandbox does not expose lower path as a side effect', () => {
-    // Creating a new file via the overlay DST triggers a copy-up into upper.
-    // This must not cause the lower directory to become accessible at its host path.
-    const { lower, upper, work, dst, cleanup } = makeOverlayDirs();
-    fs.writeFileSync(path.join(lower, 'base.txt'), 'from-lower\n');
-    try {
-      const resp = rpcWith(
-        ['--overlay', `${lower}:${upper}:${work}:${dst}`],
-        // Write via dst (triggers copy-up), then try to reach lower by host path.
-        `echo new > "${dst}/new.txt" && [ -d "${lower}" ] && echo lower-visible || echo lower-hidden`,
-      );
-      assert.equal(resp.exit_code, 0);
-      assert.equal(resp.stdout.trim(), 'lower-hidden',
-        'lower directory must remain inaccessible after copy-up',
-      );
-    } finally {
-      cleanup();
-    }
-  });
-});
-
-// ---------------------------------------------------------------------------
-// Overlay copy-up correctness (xino=off)
+// COW copy-up correctness (xino=off)
 //
 // overlayfs copy-up can fail with EOVERFLOW when the lower filesystem's inode
 // numbers exceed what the upper tmpfs can encode (xino feature).  The fix is
@@ -643,57 +250,43 @@ describe('sandbox — overlay lower-layer isolation', () => {
 // real host filesystem as the lower layer, which has large inode numbers.
 // ---------------------------------------------------------------------------
 
-describe('sandbox — overlay copy-up without EOVERFLOW', () => {
-  test('writing a new file into an existing lower-layer subdirectory succeeds', () => {
-    // This is the exact pattern from fibmod_test.js:
-    //   fs.writeFile(path.join(__dirname, 'module', 'check.js'), '')
-    // where __dirname/module/ exists in the lower layer (host CWD).
-    const lower = fs.mkdtempSync(path.join(TEMPDIR, 'boxsh-xino-lower-'));
-    const tmp   = fs.mkdtempSync(path.join(TEMPDIR, 'boxsh-xino-tmp-'));
-    const upper = path.join(tmp, 'upper');
-    const work  = path.join(tmp, 'work');
-    fs.mkdirSync(upper); fs.mkdirSync(work);
+describe('sandbox — cow copy-up without EOVERFLOW', () => {
+  test('writing a new file into an existing src subdirectory succeeds', () => {
+    const { src, dst, cleanup } = makeCowDirs();
     try {
-      fs.mkdirSync(path.join(lower, 'module'));
-      fs.writeFileSync(path.join(lower, 'module', 'existing.js'), '// existing\n');
+      fs.mkdirSync(path.join(src, 'module'));
+      fs.writeFileSync(path.join(src, 'module', 'existing.js'), '// existing\n');
       const r = spawnSync(
         BOXSH,
-        ['--sandbox',
-         '--overlay', `${lower}:${upper}:${work}:${lower}`,
-         '-c', `touch "${lower}/module/new1.js" && touch "${lower}/module/new2.js" && echo ok`],
-        { encoding: 'utf8', cwd: lower, timeout: 5000 },
+        ['--sandbox', '--bind', `cow:${src}:${dst}`,
+         '-c', `touch "${dst}/module/new1.js" && touch "${dst}/module/new2.js" && echo ok`],
+        { encoding: 'utf8', cwd: src, timeout: 5000 },
       );
       assert.equal(r.status, 0,
         `copy-up failed (EOVERFLOW?): exit=${r.status}\nstderr: ${r.stderr}\nstdout: ${r.stdout}`);
       assert.equal(r.stdout.trim(), 'ok');
     } finally {
-      spawnSync('rm', ['-rf', lower, tmp]);
+      cleanup();
     }
   });
 
-  test('copy-up of a lower-layer file for modification succeeds', () => {
-    // Modifying an existing lower-layer file triggers copy-up of that file.
-    const lower = fs.mkdtempSync(path.join(TEMPDIR, 'boxsh-xino-lower-'));
-    const tmp   = fs.mkdtempSync(path.join(TEMPDIR, 'boxsh-xino-tmp-'));
-    const upper = path.join(tmp, 'upper');
-    const work  = path.join(tmp, 'work');
-    fs.mkdirSync(upper); fs.mkdirSync(work);
+  test('copy-up of a src-layer file for modification succeeds', () => {
+    const { src, dst, cleanup } = makeCowDirs();
     try {
-      fs.writeFileSync(path.join(lower, 'config.json'), '{"v":1}\n');
+      fs.writeFileSync(path.join(src, 'config.json'), '{"v":1}\n');
       const r = spawnSync(
         BOXSH,
-        ['--sandbox',
-         '--overlay', `${lower}:${upper}:${work}:${lower}`,
-         '-c', `echo '{"v":2}' > "${lower}/config.json" && cat "${lower}/config.json"`],
-        { encoding: 'utf8', cwd: lower, timeout: 5000 },
+        ['--sandbox', '--bind', `cow:${src}:${dst}`,
+         '-c', `echo '{"v":2}' > "${dst}/config.json" && cat "${dst}/config.json"`],
+        { encoding: 'utf8', cwd: src, timeout: 5000 },
       );
       assert.equal(r.status, 0,
         `copy-up of existing file failed: exit=${r.status}\nstderr: ${r.stderr}`);
       assert.match(r.stdout, /\{"v":2\}/);
-      // Host file must be unchanged (COW guarantee).
-      assert.equal(fs.readFileSync(path.join(lower, 'config.json'), 'utf8'), '{"v":1}\n');
+      // src must be unchanged (COW guarantee).
+      assert.equal(fs.readFileSync(path.join(src, 'config.json'), 'utf8'), '{"v":1}\n');
     } finally {
-      spawnSync('rm', ['-rf', lower, tmp]);
+      cleanup();
     }
   });
 
@@ -725,63 +318,53 @@ describe('sandbox — overlay copy-up without EOVERFLOW', () => {
 //
 // On XFS with inode numbers > 2^31, kernel overlayfs fails with EINVAL in a
 // user namespace.  boxsh should automatically fall back to fuse-overlayfs.
-// These tests verify the fallback works, including a mixed scenario where one
-// overlay uses kernel overlayfs and another uses fuse-overlayfs in the same
-// sandbox session.
 // ---------------------------------------------------------------------------
 
 describe('sandbox — fuse-overlayfs fallback', () => {
   // Skip the entire suite if fuse-overlayfs is not installed.
   const hasFuseOverlayfs = spawnSync('which', ['fuse-overlayfs']).status === 0;
 
-  // Create overlay dirs under TEMPDIR (XFS, large inodes) so kernel overlayfs
-  // will fail and trigger the fuse-overlayfs fallback.
-  function makeXfsDirs() {
+  /** Create COW dirs under TEMPDIR (XFS, large inodes) to trigger fallback. */
+  function makeFuseDirs() {
     const base = fs.mkdtempSync(path.join(TEMPDIR, 'boxsh-fuse-'));
-    const lower = path.join(base, 'lower');
-    const upper = path.join(base, 'upper');
-    const work  = path.join(base, 'work');
-    const dst   = path.join(base, 'dst');
-    for (const d of [lower, upper, work, dst]) fs.mkdirSync(d);
-    return {
-      lower, upper, work, dst,
-      cleanup: () => spawnSync('rm', ['-rf', base]),
-    };
+    const src  = path.join(base, 'src');
+    const dst  = path.join(base, 'dst');
+    fs.mkdirSync(src); fs.mkdirSync(dst);
+    return { src, dst, cleanup: () => spawnSync('rm', ['-rf', base]) };
   }
 
-  test('single overlay on XFS falls back to fuse-overlayfs', { skip: !hasFuseOverlayfs && 'fuse-overlayfs not installed' }, () => {
-    const d = makeXfsDirs();
+  test('single cow on XFS falls back to fuse-overlayfs',
+    { skip: !hasFuseOverlayfs && 'fuse-overlayfs not installed' }, () => {
+    const { src, dst, cleanup } = makeFuseDirs();
     try {
-      fs.writeFileSync(path.join(d.lower, 'hello.txt'), 'fuse-lower\n');
-      const resp = rpcWith(
-        ['--overlay', `${d.lower}:${d.upper}:${d.work}:${d.dst}`],
-        `cat ${d.dst}/hello.txt`,
-      );
+      fs.writeFileSync(path.join(src, 'hello.txt'), 'fuse-src\n');
+      const resp = rpcCow(src, dst, `cat ${dst}/hello.txt`);
       assert.equal(resp.exit_code, 0, `cmd failed; stderr: ${resp.stderr}`);
-      assert.equal(resp.stdout, 'fuse-lower\n');
+      assert.equal(resp.stdout, 'fuse-src\n');
     } finally {
-      d.cleanup();
+      cleanup();
     }
   });
 
-  test('fuse-overlayfs COW: writes go to upper, lower unchanged', { skip: !hasFuseOverlayfs && 'fuse-overlayfs not installed' }, () => {
-    const d = makeXfsDirs();
+  test('fuse-overlayfs COW: writes go to dst, src unchanged',
+    { skip: !hasFuseOverlayfs && 'fuse-overlayfs not installed' }, () => {
+    const { src, dst, cleanup } = makeFuseDirs();
     try {
-      fs.writeFileSync(path.join(d.lower, 'data.txt'), 'original\n');
-      const resp = rpcWith(
-        ['--overlay', `${d.lower}:${d.upper}:${d.work}:${d.dst}`],
-        `echo modified > ${d.dst}/data.txt && echo new > ${d.dst}/new.txt`,
+      fs.writeFileSync(path.join(src, 'data.txt'), 'original\n');
+      const resp = rpcCow(src, dst,
+        `echo modified > ${dst}/data.txt && echo new > ${dst}/new.txt`,
       );
       assert.equal(resp.exit_code, 0, `cmd failed; stderr: ${resp.stderr}`);
-      assert.equal(fs.readFileSync(path.join(d.lower, 'data.txt'), 'utf8'), 'original\n');
-      assert.equal(fs.readFileSync(path.join(d.upper, 'data.txt'), 'utf8'), 'modified\n');
-      assert.equal(fs.readFileSync(path.join(d.upper, 'new.txt'), 'utf8'), 'new\n');
+      assert.equal(fs.readFileSync(path.join(src, 'data.txt'), 'utf8'), 'original\n');
+      assert.equal(fs.readFileSync(path.join(dst, 'data.txt'), 'utf8'), 'modified\n');
+      assert.equal(fs.readFileSync(path.join(dst, 'new.txt'), 'utf8'), 'new\n');
     } finally {
-      d.cleanup();
+      cleanup();
     }
   });
 
-  test('--try mode on XFS directory uses fuse-overlayfs', { skip: !hasFuseOverlayfs && 'fuse-overlayfs not installed' }, () => {
+  test('--try mode on XFS directory uses fuse-overlayfs',
+    { skip: !hasFuseOverlayfs && 'fuse-overlayfs not installed' }, () => {
     const cwd = fs.mkdtempSync(path.join(TEMPDIR, 'boxsh-fuse-try-'));
     try {
       fs.writeFileSync(path.join(cwd, 'seed.txt'), 'host\n');
@@ -797,53 +380,6 @@ describe('sandbox — fuse-overlayfs fallback', () => {
       assert.equal(fs.readFileSync(path.join(cwd, 'seed.txt'), 'utf8'), 'host\n');
     } finally {
       spawnSync('rm', ['-rf', cwd]);
-    }
-  });
-
-  test('mixed: kernel overlayfs + fuse-overlayfs in same session', { skip: !hasFuseOverlayfs && 'fuse-overlayfs not installed' }, () => {
-    // Overlay A: lower on tmpfs (created inside sandbox via --tmpfs).
-    // We simulate this by using a lower dir whose inode < 2^31 — /etc is
-    // always on the root fs with a small inode.
-    //
-    // Overlay B: lower on XFS with large inode (TEMPDIR).
-    // This one will fail kernel overlayfs and fall back to fuse-overlayfs.
-    const dXfs = makeXfsDirs();
-    // Create a second overlay set also on XFS but with a tmpfs-based lower.
-    // We do this by creating a tmpfs --overlay where the lower is /usr/share/doc
-    // (small inode, kernel overlayfs should succeed).
-    const dSmall = fs.mkdtempSync(path.join(TEMPDIR, 'boxsh-mixed-'));
-    const smallLower = path.join(dSmall, 'lower');
-    const smallUpper = path.join(dSmall, 'upper');
-    const smallWork  = path.join(dSmall, 'work');
-    const smallDst   = path.join(dSmall, 'dst');
-    for (const d of [smallLower, smallUpper, smallWork, smallDst]) fs.mkdirSync(d);
-
-    try {
-      fs.writeFileSync(path.join(dXfs.lower, 'xfs.txt'), 'from-xfs\n');
-      fs.writeFileSync(path.join(smallLower, 'small.txt'), 'from-small\n');
-
-      const input = JSON.stringify({
-        id: '1',
-        cmd: `cat ${dXfs.dst}/xfs.txt && cat ${smallDst}/small.txt`,
-      }) + '\n';
-      const r = run(
-        [
-          '--rpc', '--workers', '1', '--sandbox',
-          '--overlay', `${dXfs.lower}:${dXfs.upper}:${dXfs.work}:${dXfs.dst}`,
-          '--overlay', `${smallLower}:${smallUpper}:${smallWork}:${smallDst}`,
-        ],
-        input,
-        10000,
-      );
-      assert.equal(r.signal, null, `boxsh killed by signal ${r.signal}`);
-      const line = r.stdout.trim();
-      assert.ok(line.length > 0, `no output; stderr: ${r.stderr}`);
-      const resp = JSON.parse(line);
-      assert.equal(resp.exit_code, 0, `cmd failed; stderr: ${resp.stderr}`);
-      assert.equal(resp.stdout, 'from-xfs\nfrom-small\n');
-    } finally {
-      dXfs.cleanup();
-      spawnSync('rm', ['-rf', dSmall]);
     }
   });
 });

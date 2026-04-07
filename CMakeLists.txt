@@ -125,7 +125,8 @@ target_compile_options(dash_static
         # dash uses some GNU extensions.
         -D_GNU_SOURCE
         # dash's Makefile uses -include config.h; replicate that here.
-        -include ${DASH_ROOT}/config.h
+        # On macOS, use config_darwin.h which overrides three incompatible defines.
+        $<IF:$<BOOL:${APPLE}>,-include ${DASH_ROOT}/config_darwin.h,-include ${DASH_ROOT}/config.h>
 )
 
 # ---------------------------------------------------------------------------
@@ -143,9 +144,15 @@ target_include_directories(nlohmann_json INTERFACE
 add_executable(boxsh
     src/main.cpp
     src/rpc.cpp
-    src/sandbox.cpp
     src/worker_pool.cpp
 )
+
+# Platform-specific sandbox implementation.
+if(APPLE)
+    target_sources(boxsh PRIVATE src/sandbox_darwin.cpp)
+else()
+    target_sources(boxsh PRIVATE src/sandbox.cpp)
+endif()
 
 target_include_directories(boxsh
     PRIVATE
@@ -167,12 +174,19 @@ target_compile_options(boxsh
         -Wno-unused-parameter
 )
 
+# tinfo is a Linux ncurses sub-library; macOS uses ncurses directly.
+if(APPLE)
+    set(BOXSH_TERM_LIB ncurses)
+else()
+    set(BOXSH_TERM_LIB tinfo)
+endif()
+
 target_link_libraries(boxsh
     PRIVATE
         dash_static
         nlohmann_json
         libedit_vendored
-        tinfo
+        ${BOXSH_TERM_LIB}
         pthread
 )
 

@@ -1,6 +1,6 @@
 # boxsh Usage Guide
 
-boxsh is a sandboxed POSIX shell with built-in Linux namespace isolation and a programmable JSON-line RPC interface.
+boxsh is a sandboxed POSIX shell with built-in OS-native isolation and a programmable JSON-line RPC interface.
 
 It works in two modes: **Shell mode** — a drop-in `/bin/sh` replacement with optional sandboxing and overlay COW; and **RPC mode** — a JSON protocol backend that AI agents, build systems, or orchestration layers can drive programmatically.
 
@@ -33,7 +33,7 @@ This guide walks through the core scenarios boxsh is built for, with concrete ex
 
 ## How it Works
 
-boxsh is a single static binary with a built-in POSIX shell. It uses Linux kernel features — namespaces and overlayfs — to provide process-level filesystem isolation. No root privileges, no Docker, no daemon, no runtime dependencies.
+boxsh is a single static binary with a built-in POSIX shell. It uses OS-native sandbox mechanisms — Linux namespaces and overlayfs on Linux, Seatbelt and clonefile on macOS — to provide process-level filesystem isolation. No root privileges, no Docker, no daemon, no runtime dependencies.
 
 ### Namespace Sandbox
 
@@ -43,7 +43,6 @@ When you pass `--sandbox`, boxsh creates an isolated environment for the shell p
 |---|---|
 | **User mapping** | You appear as root inside the sandbox, but you're still your normal user on the host. No `sudo` needed. |
 | **Private mounts** | Overlay mounts, bind mounts, and tmpfs are visible only inside the sandbox. The host mount table is unaffected. |
-| **PID isolation** (`--new-pid-ns`) | The sandbox has its own process tree. Host processes are invisible and cannot be signaled. |
 | **Network isolation** (`--new-net-ns`) | The sandbox gets an empty network stack. No outbound connections — `curl`, `wget`, `npm install` (from registry) all fail. |
 
 With `--sandbox`, boxsh switches the root to a clean tmpfs and automatically includes standard system directories (`/usr`, `/proc`, `/dev`, `/tmp`, and selected `/etc` files). Only the mounts you specify are accessible; everything else is hidden.
@@ -75,11 +74,11 @@ flowchart TB
 
 ### Overlayfs Copy-on-Write
 
-The `--overlay` flag mounts a directory with copy-on-write semantics. Your original files serve as a read-only base layer. A separate upper directory captures all modifications:
+The `--bind cow:` flag mounts a directory with copy-on-write semantics. Your original files serve as a read-only base layer. A separate destination directory captures all modifications:
 
 - **Reads** go straight to the original files — zero copy, zero overhead.
-- **Writes** are automatically redirected to the upper directory. The original file is never touched.
-- **Deletes** create a marker (whiteout) in the upper directory. The original file remains intact.
+- **Writes** are automatically redirected to the destination directory. The original file is never touched.
+- **Deletes** create a marker (whiteout) in the destination directory. The original file remains intact.
 
 ```mermaid
 flowchart LR
@@ -90,12 +89,12 @@ flowchart LR
         F3["node_modules/ (new)"]
     end
 
-    subgraph Upper["upper/ (writable)"]
+    subgraph Upper["dst/ (writable)"]
         U1["node_modules/"]
         U2[".wh.temp.txt (whiteout)"]
     end
 
-    subgraph Lower["lower/ (read-only, original project)"]
+    subgraph Lower["src/ (read-only, original project)"]
         L1["README.md"]
         L2["src/main.cpp"]
         L3["temp.txt"]
@@ -105,7 +104,7 @@ flowchart LR
     Upper -- "override / add" --> Merged
 ```
 
-No matter how many `npm install`, `make`, or `rm -rf` commands run inside the sandbox, the original directory never changes. All modifications accumulate in the upper directory — you can inspect them with `find upper/` or use the SDK's `getChanges()` to get a structured list of added, modified, and deleted files.
+No matter how many `npm install`, `make`, or `rm -rf` commands run inside the sandbox, the original directory never changes. All modifications accumulate in the destination directory — you can inspect them with `find dst/` or use the SDK's `getChanges()` to get a structured list of added, modified, and deleted files.
 
 Multiple lower layers are also supported — boxsh uses this to enable session branching (see Scenario 3).
 
@@ -182,7 +181,7 @@ This works, but has real costs:
 - **Cold start overhead.** Pulling/building images, launching the container runtime, setting up the network bridge — even a warm start takes 500ms–2s. boxsh starts in under 5ms.
 - **Heavy dependency.** Requires dockerd, containerd, and runc. Root or a Docker socket. On CI you need Docker-in-Docker or a privileged runner. boxsh is a static binary with no runtime dependencies.
 - **Coarse filesystem isolation.** A bind mount exposes the directory read-write. To protect the host you need a volume copy or a multi-stage setup. With boxsh the overlay is built in — the project is always read-only; writes go to a separate directory automatically.
-- **No built-in diff.** After the container exits, you have to diff the volume yourself. boxsh's `getChanges()` (SDK) or `find upper/` gives you the exact list of added, modified, and deleted files.
+- **No built-in diff.** After the container exits, you have to diff the volume yourself. boxsh's `getChanges()` (SDK) or `find dst/` gives you the exact list of added, modified, and deleted files.
 - **No session branching.** You can't fork a running container into two divergent sessions without committing an image. boxsh branches by stacking overlays (see Scenario 3).
 
 | | Docker | boxsh |
@@ -191,44 +190,42 @@ This works, but has real costs:
 | Dependencies | dockerd + containerd + runc | Single static binary |
 | Filesystem isolation | Bind mount (manual COW) | Built-in overlay COW |
 | Network isolation | Bridge + iptables | `--new-net-ns` (empty network) |
-| Diff after run | Manual | `getChanges()` / `find upper/` |
+| Diff after run | Manual | `getChanges()` / `find dst/` |
 | Session branching | Commit image + new container | Stack overlays |
 
-**Solution.** Give the agent a boxsh instance with `--sandbox`, `--new-net-ns`, and `--overlay`. The agent sees a full working directory it can read and write freely, but every modification lands in a throwaway upper layer. The network is cut off. The host is untouched.
+**Solution.** Give the agent a boxsh instance with `--sandbox`, `--new-net-ns`, and `--bind cow:`. The agent sees a full working directory it can read and write freely, but every modification lands in a throwaway destination directory. The network is cut off. The host is untouched.
 
 ```sh
 # Prepare the sandbox workspace
 project=/home/user/myproject
 sandbox=/tmp/agent-session
-mkdir -p "$sandbox"/{upper,work,mnt}
+mkdir -p "$sandbox/dst"
 
 # Start boxsh in RPC mode — the agent talks to this over stdin/stdout
 boxsh --rpc --workers 2 --sandbox --new-net-ns \
-  --overlay "$project:$sandbox/upper:$sandbox/work:/workspace"
+  --bind cow:"$project:$sandbox/dst"
 ```
 
 Now the agent sends JSON commands:
 
 ```json
-{"id":"1", "cmd":"cd /workspace && npm install"}
-{"id":"2", "cmd":"cd /workspace && npm test"}
+{"id":"1", "cmd":"cd /tmp/agent-session/dst && npm install"}
+{"id":"2", "cmd":"cd /tmp/agent-session/dst && npm test"}
 ```
 
-Inside the sandbox, `/workspace` looks like a complete copy of the project — the agent can `npm install`, create files, delete files, run builds. But:
+Inside the sandbox, `$sandbox/dst` looks like a complete copy of the project — the agent can `npm install`, create files, delete files, run builds. But:
 
-- **All writes go to `$sandbox/upper/`**. The original project is never modified.
+- **All writes go to `$sandbox/dst/`**. The original project is never modified.
 - **Outbound network is blocked** (`--new-net-ns`). The agent can't `curl` or `wget` anything from the internet; `npm install` only works if the packages are already in the overlay.
 
-Add `--new-pid-ns` to also hide the host PID tree, preventing the agent from seeing or signaling other processes.
-
-When the agent finishes, you inspect the upper layer to decide what to keep:
+When the agent finishes, you inspect the destination directory to decide what to keep:
 
 ```sh
 # See what changed
-find "$sandbox/upper" -type f
+find "$sandbox/dst" -type f
 
 # Happy with the result? Copy it back
-cp -a "$sandbox/upper/." "$project/"
+cp -a "$sandbox/dst/." "$project/"
 
 # Not happy? Discard everything
 rm -rf "$sandbox"
@@ -241,35 +238,32 @@ import { BoxshClient, getChanges, formatChanges } from 'boxsh.js';
 import fs from 'node:fs';
 
 const sandbox = '/tmp/agent-session';
-fs.mkdirSync(`${sandbox}/upper`, { recursive: true });
-fs.mkdirSync(`${sandbox}/work`,  { recursive: true });
-fs.mkdirSync(`${sandbox}/mnt`,   { recursive: true });
+fs.mkdirSync(`${sandbox}/dst`, { recursive: true });
 
 const client = new BoxshClient({
     sandbox: true,
     newNetNs: true,
-    overlay: {
-        lower: '/home/user/myproject',
-        upper: `${sandbox}/upper`,
-        work:  `${sandbox}/work`,
-        dst:   '/workspace',
-    },
+    binds: [{
+        mode: 'cow',
+        src: '/home/user/myproject',
+        dst: `${sandbox}/dst`,
+    }],
 });
 
-await client.exec('npm install', '/workspace');
-await client.exec('npm test',    '/workspace');
+await client.exec('npm install', `${sandbox}/dst`);
+await client.exec('npm test',    `${sandbox}/dst`);
 
 // Use built-in file tools — no shell round-trip needed
-const pkg = await client.read('/workspace/package.json');
-await client.write('/workspace/notes.txt', 'Agent completed run.\n');
-await client.edit('/workspace/config.js', [
+const pkg = await client.read(`${sandbox}/dst/package.json`);
+await client.write(`${sandbox}/dst/notes.txt`, 'Agent completed run.\n');
+await client.edit(`${sandbox}/dst/config.js`, [
     { oldText: 'DEBUG = false', newText: 'DEBUG = true' },
 ]);
 
 await client.close();
 
 // Inspect what the agent actually changed
-const changes = getChanges({ upper: `${sandbox}/upper`, base: '/home/user/myproject' });
+const changes = getChanges({ upper: `${sandbox}/dst`, base: '/home/user/myproject' });
 console.log(formatChanges(changes));
 // M  package-lock.json
 // A  node_modules/
@@ -295,26 +289,24 @@ console.log(formatChanges(changes));
 
 All of these either copy data (slow, wasteful) or require a specific filesystem/tool.
 
-**Solution with boxsh.** Mount the directory as the lower layer of an overlay. Reads go straight to the original files (zero copy). Writes land in a separate upper directory. The original directory is never touched.
+**Solution with boxsh.** Mount the directory as the source of a COW bind. Reads go straight to the original files (zero copy). Writes land in a separate destination directory. The original directory is never touched.
 
 ```sh
 # "Fork" a 10 GB sysroot in zero time
 base=/opt/sysroot
-upper=/tmp/experiment/upper
-work=/tmp/experiment/work
-mnt=/tmp/experiment/mnt
-mkdir -p "$upper" "$work" "$mnt"
+dst=/tmp/experiment/dst
+mkdir -p "$dst"
 
-boxsh --sandbox --overlay "$base:$upper:$work:$mnt" -c '
+boxsh --sandbox --bind cow:"$base:$dst" -c '
     # Install a package "experimentally"
-    cd /tmp/experiment/mnt
-    make install PREFIX=/tmp/experiment/mnt/usr
+    cd /tmp/experiment/dst
+    make install PREFIX=/tmp/experiment/dst/usr
     echo "Installed files:"
-    find /tmp/experiment/mnt/usr -type f
+    find /tmp/experiment/dst/usr -type f
 '
 
 # The original /opt/sysroot is completely untouched
-# All installed files are physically in $upper/usr/
+# All installed files are physically in $dst/usr/
 ```
 
 This works for **any directory** — it's not limited to git repos. You can fork a Python venv, a Docker layer, a database data directory, or a compiled build tree.
@@ -337,7 +329,7 @@ This works for **any directory** — it's not limited to git repos. You can fork
 | `cp -a` the working directory | O(n) copy. For a 5 GB directory with 200K files, this takes minutes. Two branches = two full copies = 10 GB extra disk. |
 | Filesystem snapshot (btrfs/ZFS) | Fast, but requires a specific filesystem. Not available on ext4, xfs, or typical cloud VMs. |
 
-**Solution with boxsh.** overlayfs can be stacked. The current session's upper layer becomes the read-only lower layer for the next level. The original session is untouched — you just create new overlays on top of it.
+**Solution with boxsh.** overlayfs can be stacked. The current session's destination directory becomes the read-only source for the next level. The original session is untouched — you just create new overlays on top of it.
 
 ### How it works
 
@@ -345,80 +337,79 @@ Suppose session A is running with this layout:
 
 ```
 base (your project, read-only)
-  └── upper_a (session A's modifications)
+  └── dst_a (session A's modifications)
 ```
 
-You want to branch into two new sessions without disturbing session A. Stop the boxsh process, then stack two new overlays on top of `upper_a`:
+You want to branch into two new sessions without disturbing session A. Stop the boxsh process, then stack two new overlays on top of `dst_a`:
 
 ```
 base (read-only)
-  └── upper_a (session A, now frozen as lower layer)
-        ├── upper_a1 (branch A1 — new writes go here)
-        └── upper_b  (branch B  — new writes go here)
+  └── dst_a (session A, now frozen as source)
+        ├── dst_a1 (branch A1 — new writes go here)
+        └── dst_b  (branch B  — new writes go here)
 ```
 
-Both branches see the full state of session A, but new writes go to their own upper directories. Session A's `upper_a` is never modified again.
+Both branches see the full state of session A, but new writes go to their own destination directories. Session A's `dst_a` is never modified again.
 
 ### Branching in practice
 
 ```sh
 # Session A has been running with:
-#   --overlay "$project:$session/upper_a:$session/work_a:/workspace"
-# Stop the boxsh process. upper_a now contains all of A's modifications.
+#   --bind cow:"$project:$session/dst_a"
+# Stop the boxsh process. dst_a now contains all of A's modifications.
 
 project=/home/user/myproject
 session=/tmp/agent-session
 
-# Create new upper/work dirs for each branch
-mkdir -p "$session"/{upper_a1,work_a1,upper_b,work_b}
+# Create new dst dirs for each branch
+mkdir -p "$session"/{dst_a1,dst_b}
 
 # Branch A1: continues where A left off
-# LOWER = "upper_a:project" — overlayfs merges both layers, upper_a on top
 boxsh --rpc --sandbox \
-  --overlay "$session/upper_a:$project:$session/upper_a1:$session/work_a1:/workspace" &
+  --bind cow:"$session/dst_a:$session/dst_a1" &
 pid_a1=$!
 
 # Branch B: also continues where A left off
 boxsh --rpc --sandbox \
-  --overlay "$session/upper_a:$project:$session/upper_b:$session/work_b:/workspace" &
+  --bind cow:"$session/dst_a:$session/dst_b" &
 pid_b=$!
 
 # Send different commands to each branch...
 # Branch A1: try lodash
-echo '{"id":"1","cmd":"cd /workspace && npm install lodash"}' \
+echo '{"id":"1","cmd":"cd '$session'/dst_a1 && npm install lodash"}' \
   > /proc/$pid_a1/fd/0
 
 # Branch B: try underscore
-echo '{"id":"1","cmd":"cd /workspace && npm install underscore"}' \
+echo '{"id":"1","cmd":"cd '$session'/dst_b && npm install underscore"}' \
   > /proc/$pid_b/fd/0
 ```
 
 After both branches finish, compare:
 
 ```sh
-diff <(find "$session/upper_a1" -type f | sort) \
-     <(find "$session/upper_b"  -type f | sort)
+diff <(find "$session/dst_a1" -type f | sort) \
+     <(find "$session/dst_b"  -type f | sort)
 ```
 
-`upper_a` is completely untouched. You can branch again from it, or resume session A by creating yet another overlay on top of it.
+`dst_a` is completely untouched. You can branch again from it, or resume session A by creating yet another overlay on top of it.
 
 ### Rolling back
 
-Rolling back is just discarding the branch's upper directory and creating a fresh one:
+Rolling back is just discarding the branch's destination directory and creating a fresh one:
 
 ```sh
 # Branch A1 went wrong — discard and retry
-rm -rf "$session/upper_a1" "$session/work_a1"
-mkdir -p "$session/upper_a1" "$session/work_a1"
-# Restart boxsh with the same overlay — back to session A's state
+rm -rf "$session/dst_a1"
+mkdir -p "$session/dst_a1"
+# Restart boxsh with the same --bind cow: — back to session A's state
 ```
 
 ### Saving a checkpoint
 
-You can also archive a session's upper layer for long-term storage:
+You can also archive a session's destination directory for long-term storage:
 
 ```sh
-tar czf checkpoint-a.tar.gz -C "$session/upper_a" .
+tar czf checkpoint-a.tar.gz -C "$session/dst_a" .
 ```
 
 Restore later by extracting into a new directory and using it as a lower layer.
@@ -444,36 +435,36 @@ This works, but has real limitations:
 - **Cleanup required.** Worktrees must be removed with `git worktree remove`; stale worktrees accumulate and confuse tooling.
 - **No write isolation between workers.** Two worktrees on the same branch can write to shared git state (index, refs) and conflict.
 
-**Solution with boxsh.** Share one read-only base across all workers via overlay. Each worker gets its own copy-on-write view — no data is duplicated. Only files that a worker actually modifies consume additional disk space.
+**Solution with boxsh.** Share one read-only base across all workers via COW bind. Each worker gets its own copy-on-write view — no data is duplicated. Only files that a worker actually modifies consume additional disk space.
 
-| | `git worktree` | boxsh overlay |
+| | `git worktree` | boxsh COW bind |
 |---|---|---|
 | Setup time | Full checkout per worktree | Instant (kernel mount) |
 | Disk cost | Full copy per worktree | Only modified files |
 | Works on non-git dirs | No | Yes |
 | Write isolation | Shared git state | Complete (per-process COW) |
-| Cleanup | `git worktree remove` | `rm -rf upper/` |
+| Cleanup | `git worktree remove` | `rm -rf dst/` |
 
 ```sh
 # 8 workers, all sharing the same base, each with COW semantics
 boxsh --rpc --workers 8 --sandbox \
-  --overlay "/opt/sysroot:/tmp/parallel/upper:/tmp/parallel/work:/sysroot"
+  --bind cow:"/opt/sysroot:/tmp/parallel/dst"
 ```
 
 Send 8 requests at once — they execute in parallel:
 
 ```sh
 printf '%s\n' \
-  '{"id":"test-1", "cmd":"cd /sysroot && make test SUITE=unit"}' \
-  '{"id":"test-2", "cmd":"cd /sysroot && make test SUITE=integration"}' \
-  '{"id":"test-3", "cmd":"cd /sysroot && make test SUITE=e2e"}' \
-  '{"id":"build-1","cmd":"cd /sysroot && make build ARCH=x86_64"}' \
-  '{"id":"build-2","cmd":"cd /sysroot && make build ARCH=aarch64"}' \
-  '{"id":"lint",   "cmd":"cd /sysroot && make lint"}' \
-  '{"id":"docs",   "cmd":"cd /sysroot && make docs"}' \
-  '{"id":"bench",  "cmd":"cd /sysroot && make bench"}' \
+  '{"id":"test-1", "cmd":"cd /tmp/parallel/dst && make test SUITE=unit"}' \
+  '{"id":"test-2", "cmd":"cd /tmp/parallel/dst && make test SUITE=integration"}' \
+  '{"id":"test-3", "cmd":"cd /tmp/parallel/dst && make test SUITE=e2e"}' \
+  '{"id":"build-1","cmd":"cd /tmp/parallel/dst && make build ARCH=x86_64"}' \
+  '{"id":"build-2","cmd":"cd /tmp/parallel/dst && make build ARCH=aarch64"}' \
+  '{"id":"lint",   "cmd":"cd /tmp/parallel/dst && make lint"}' \
+  '{"id":"docs",   "cmd":"cd /tmp/parallel/dst && make docs"}' \
+  '{"id":"bench",  "cmd":"cd /tmp/parallel/dst && make bench"}' \
 | boxsh --rpc --workers 8 --sandbox \
-    --overlay "/opt/sysroot:/tmp/parallel/upper:/tmp/parallel/work:/sysroot"
+    --bind cow:"/opt/sysroot:/tmp/parallel/dst"
 ```
 
 Responses stream back as each task finishes — fast tasks don't wait for slow ones. If a worker crashes (OOM, timeout), the coordinator respawns it automatically and returns an error response for that request only. Other workers are unaffected.
@@ -486,20 +477,19 @@ import { BoxshClient } from 'boxsh.js';
 const client = new BoxshClient({
     workers: 8,
     sandbox: true,
-    overlay: {
-        lower: '/opt/sysroot',
-        upper: '/tmp/parallel/upper',
-        work:  '/tmp/parallel/work',
-        dst:   '/sysroot',
-    },
+    binds: [{
+        mode: 'cow',
+        src: '/opt/sysroot',
+        dst: '/tmp/parallel/dst',
+    }],
 });
 
 const results = await Promise.all([
-    client.exec('make test SUITE=unit',        '/sysroot'),
-    client.exec('make test SUITE=integration', '/sysroot'),
-    client.exec('make test SUITE=e2e',         '/sysroot'),
-    client.exec('make build ARCH=x86_64',      '/sysroot'),
-    client.exec('make build ARCH=aarch64',     '/sysroot'),
+    client.exec('make test SUITE=unit',        '/tmp/parallel/dst'),
+    client.exec('make test SUITE=integration', '/tmp/parallel/dst'),
+    client.exec('make test SUITE=e2e',         '/tmp/parallel/dst'),
+    client.exec('make build ARCH=x86_64',      '/tmp/parallel/dst'),
+    client.exec('make build ARCH=aarch64',     '/tmp/parallel/dst'),
 ]);
 
 for (const r of results) {
@@ -525,33 +515,33 @@ await client.close();
 | Docker: build a test image | `COPY . /app && RUN make install` in a Dockerfile. Gives you a diff via `docker diff`, but requires dockerd, an image build, and doesn't easily let you compare the result to the host filesystem. |
 | VM snapshot | Same as LVM but even heavier — snapshot the entire machine, try the operation, revert if it fails. Minutes of downtime. |
 
-**Solution with boxsh.** Run the operation on an overlay. The original filesystem is read-only. After the operation completes, inspect the upper layer to see every file that was touched.
+**Solution with boxsh.** Run the operation on a COW overlay. The original filesystem is read-only. After the operation completes, inspect the destination directory to see every file that was touched.
 
 ### Preview a `make install`
 
 ```sh
-mkdir -p /tmp/dryrun/{upper,work,mnt}
+mkdir -p /tmp/dryrun/dst
 
-echo '{"id":"1","cmd":"make install PREFIX=/system/usr"}' \
+echo '{"id":"1","cmd":"make install PREFIX=/tmp/dryrun/dst/usr"}' \
 | boxsh --rpc --sandbox \
-    --overlay "/:/tmp/dryrun/upper:/tmp/dryrun/work:/system"
+    --bind cow:"/:/tmp/dryrun/dst"
 
 # What would be installed?
 echo "--- Files that would be created or modified ---"
-find /tmp/dryrun/upper -type f | sed 's|^/tmp/dryrun/upper||'
+find /tmp/dryrun/dst -type f | sed 's|^/tmp/dryrun/dst||'
 ```
 
 ### Preview a package upgrade
 
 ```sh
-mkdir -p /tmp/upgrade/{upper,work,mnt}
+mkdir -p /tmp/upgrade/dst
 
 echo '{"id":"1","cmd":"apt-get install -y --simulate nginx 2>&1; dpkg --configure -a"}' \
 | boxsh --rpc --sandbox \
-    --overlay "/:/tmp/upgrade/upper:/tmp/upgrade/work:/"
+    --bind cow:"/:/tmp/upgrade/dst"
 
 # Inspect exactly which config files, binaries, and libraries would change
-find /tmp/upgrade/upper -type f | head -20
+find /tmp/upgrade/dst -type f | head -20
 ```
 
 ### Approve or discard
@@ -560,7 +550,7 @@ The workflow always ends the same way:
 
 ```sh
 # Option A: looks good — apply for real
-cp -a /tmp/dryrun/upper/. /
+cp -a /tmp/dryrun/dst/. /
 
 # Option B: something's wrong — throw it away
 rm -rf /tmp/dryrun
@@ -571,14 +561,14 @@ No rollback mechanism needed. The change never happened until you explicitly cop
 This scenario also works well in **shell mode** — run the operation directly without RPC:
 
 ```sh
-mkdir -p /tmp/dryrun/{upper,work}
+mkdir -p /tmp/dryrun/dst
 
-boxsh --sandbox --overlay "/:$PWD/upper:$PWD/work:/system" -c '
-    make install PREFIX=/system/usr
+boxsh --sandbox --bind cow:"$PWD:/tmp/dryrun/dst" -c '
+    make install PREFIX=/tmp/dryrun/dst/usr
 '
 
 # Inspect what would have been installed
-find /tmp/dryrun/upper -type f | sed 's|^/tmp/dryrun/upper||'
+find /tmp/dryrun/dst -type f | sed 's|^/tmp/dryrun/dst||'
 ```
 
 **With the Node.js SDK:**
@@ -588,19 +578,18 @@ import { BoxshClient, getChanges, formatChanges } from 'boxsh.js';
 
 const client = new BoxshClient({
     sandbox: true,
-    overlay: {
-        lower: '/',
-        upper: '/tmp/dryrun/upper',
-        work:  '/tmp/dryrun/work',
-        dst:   '/system',
-    },
+    binds: [{
+        mode: 'cow',
+        src: '/',
+        dst: '/tmp/dryrun/dst',
+    }],
 });
 
-await client.exec('make install PREFIX=/system/usr');
+await client.exec('make install PREFIX=/tmp/dryrun/dst/usr');
 await client.close();
 
 // Inspect what would change
-const changes = getChanges({ upper: '/tmp/dryrun/upper', base: '/' });
+const changes = getChanges({ upper: '/tmp/dryrun/dst', base: '/' });
 console.log(formatChanges(changes));
 // A  usr/bin/myapp
 // A  usr/lib/libmyapp.so
@@ -626,40 +615,40 @@ console.log(formatChanges(changes));
 **Solution with boxsh.** Open an interactive sandboxed shell with overlay in one command:
 
 ```sh
-mkdir -p /tmp/dev/{upper,work}
+mkdir -p /tmp/dev/dst
 
-boxsh --sandbox --overlay "$PWD:/tmp/dev/upper:/tmp/dev/work:/workspace"
+boxsh --sandbox --bind cow:"$PWD:/tmp/dev/dst"
 ```
 
-You land in an interactive shell with line editing (libedit). `/workspace` is a COW view of your project — you can read everything, and every write goes to `/tmp/dev/upper`. The host project directory is never modified.
+You land in an interactive shell with line editing (libedit). `/tmp/dev/dst` is a COW view of your project — you can read everything, and every write goes to `/tmp/dev/dst`. The host project directory is never modified.
 
 ```sh
 # Inside the sandboxed shell
-cd /workspace
-npm install           # node_modules goes to upper, not your real project
-vim config.js         # edits land in upper
-make build            # build artifacts go to upper
-rm -rf src/           # original src/ is untouched — only a whiteout is created in upper
+cd /tmp/dev/dst
+npm install           # node_modules goes to dst, not your real project
+vim config.js         # edits land in dst
+make build            # build artifacts go to dst
+rm -rf src/           # original src/ is untouched — only a whiteout is created in dst
 ```
 
 When you exit the shell, inspect and decide:
 
 ```sh
 # See what you did
-find /tmp/dev/upper -type f
+find /tmp/dev/dst -type f
 
 # Keep it? Copy back.
-cp -a /tmp/dev/upper/. "$PWD/"
+cp -a /tmp/dev/dst/. "$PWD/"
 
 # Discard it? One command.
 rm -rf /tmp/dev
 ```
 
-Add `--new-net-ns` to block outbound network, `--new-pid-ns` to hide host processes:
+Add `--new-net-ns` to block outbound network:
 
 ```sh
-boxsh --sandbox --new-net-ns --new-pid-ns \
-  --overlay "$PWD:/tmp/dev/upper:/tmp/dev/work:/workspace"
+boxsh --sandbox --new-net-ns \
+  --bind cow:"$PWD:/tmp/dev/dst"
 ```
 
 **Why this beats the alternatives:**
@@ -694,14 +683,14 @@ parent_fd, child_fd = pty.openpty()
 
 proc = subprocess.Popen(
     ['boxsh', '--sandbox', '--new-net-ns',
-     '--overlay', f'{project}:{upper}:{work}:/workspace'],
+     '--bind', f'cow:{project}:{dst}'],
     stdin=child_fd, stdout=child_fd, stderr=child_fd,
     preexec_fn=os.setsid,
 )
 os.close(child_fd)
 
 # Agent interacts via parent_fd — reads output, writes commands
-os.write(parent_fd, b'cd /workspace && ls\n')
+os.write(parent_fd, b'cd $dst && ls\n')
 output = os.read(parent_fd, 4096)
 
 os.write(parent_fd, b'npm install\n')
@@ -716,8 +705,8 @@ Or for simpler non-interactive use, pipe commands directly:
 
 ```sh
 # Agent sends commands one at a time, reads stdout/stderr
-boxsh --sandbox --overlay "$project:$upper:$work:/workspace" -c '
-    cd /workspace
+boxsh --sandbox --bind cow:"$project:$dst" -c '
+    cd "$dst"
     npm install
     npm test
 '
@@ -728,9 +717,8 @@ boxsh --sandbox --overlay "$project:$upper:$work:/workspace" -c '
 - A real POSIX shell with full syntax: pipes, redirections, variables, functions, subshells
 - Shell state persists across commands (cd, export, aliases)
 - Interactive programs work (python REPL, less, vi) when connected via PTY
-- The host filesystem is read-only — all writes land in the overlay upper layer
+- The host filesystem is read-only — all writes land in the COW destination directory
 - Network is isolated (with `--new-net-ns`) — no exfiltration risk
-- PID tree is hidden (with `--new-pid-ns`) — agent cannot see or kill host processes
 
 **When to use Shell mode vs RPC mode:**
 
@@ -750,7 +738,7 @@ boxsh --sandbox --overlay "$project:$upper:$work:/workspace" -c '
 
 ### Installation
 
-Build from source (requires CMake ≥ 3.16, GCC or Clang with C11/C++17, Linux kernel ≥ 3.8):
+Build from source (requires CMake ≥ 3.16, GCC or Clang with C11/C++17; supports Linux kernel ≥ 3.8 and macOS ≥ 10.12):
 
 ```sh
 cmake -B build
@@ -789,23 +777,23 @@ boxsh --try
 
 What it does:
 
-1. Mounts the current directory as a copy-on-write overlay — you see all your files, but every write goes to a temporary upper layer.
+1. Mounts the current directory as a copy-on-write overlay — you see all your files, but every write goes to a temporary directory.
 2. Enters an isolated namespace (private mount table, appears as root inside).
-3. When you exit the shell, the temporary layer is kept and its path is printed to stderr — inspect `upper/` to see exactly what changed, then discard when done.
+3. When you exit the shell, the temporary layer is kept and its path is printed to stderr — inspect it to see exactly what changed, then discard when done.
 
 This is equivalent to the manual form:
 
 ```sh
-mkdir -p /tmp/box/upper /tmp/box/work
+mkdir -p /tmp/box/work
 boxsh --sandbox \
-  --overlay "$PWD:/tmp/box/upper:/tmp/box/work:$PWD"
+  --bind cow:"$PWD:/tmp/box/work"
 # ... exit shell ...
 rm -rf /tmp/box
 ```
 
 but reduced to a single flag.
 
-**Use cases:** installing packages to evaluate them, running untrusted scripts, experimenting with config changes, anything where you want a "what if" shell without consequences. The `upper/` directory left behind acts as a diff — you can review or replay the changes selectively.
+**Use cases:** installing packages to evaluate them, running untrusted scripts, experimenting with config changes, anything where you want a "what if" shell without consequences. The temporary directory left behind acts as a diff — you can review or replay the changes selectively.
 
 ### RPC Mode
 
@@ -972,9 +960,6 @@ boxsh --sandbox -c 'whoami'
 # Isolate network (loopback only, no outbound access)
 boxsh --sandbox --new-net-ns -c 'curl http://example.com'
 # curl: (6) Could not resolve host: example.com
-
-# Isolate PID tree (host processes not visible)
-boxsh --sandbox --new-pid-ns -c 'ps aux'
 ```
 
 In RPC mode, each worker runs inside the sandbox — all commands share the same isolated environment:
@@ -986,52 +971,46 @@ boxsh --rpc --workers 4 --sandbox --new-net-ns
 | Flag | Effect |
 |---|---|
 | `--sandbox` | Enable sandbox isolation |
-| `--no-user-ns` | Skip user namespace (requires root for other namespaces) |
 | `--new-net-ns` | Loopback-only network |
-| `--new-pid-ns` | Isolated PID tree |
 
-#### Overlay Filesystem
+#### COW Bind (`--bind cow:`)
 
-Overlay is the primary usage pattern for boxsh. It mounts a read-only base directory as a copy-on-write workspace. Commands can read and write freely; all modifications land in the upper directory while the base remains untouched.
+COW bind is the primary usage pattern for boxsh. It mounts a read-only source directory as a copy-on-write workspace. Commands can read and write freely; all modifications land in the destination directory while the source remains untouched.
 
 ```
---overlay LOWER:UPPER:WORK:DST
+--bind cow:SRC:DST
 ```
 
 | Parameter | Description |
 |---|---|
-| `LOWER` | Read-only base directory (e.g. your project root) |
-| `UPPER` | Writable upper directory (all modifications accumulate here) |
-| `WORK` | Working directory for overlayfs metadata (same filesystem as UPPER) |
-| `DST` | Mount point visible inside the sandbox |
+| `SRC` | Read-only base directory (e.g. your project root) |
+| `DST` | Writable destination directory (all modifications accumulate here) |
 
-All four directories must exist before starting boxsh.
+Both directories must exist before starting boxsh.
 
 **Example — run `npm install` without touching the real project:**
 
 ```sh
 # Prepare directories
 project=/home/user/myproject
-upper=/tmp/sandbox/upper
-work=/tmp/sandbox/work
-mnt=/tmp/sandbox/mnt
-mkdir -p "$upper" "$work" "$mnt"
+dst=/tmp/sandbox/dst
+mkdir -p "$dst"
 
-# Run inside overlay
-echo '{"id":"1","cmd":"cd /workspace && npm install"}' \
-| boxsh --rpc --sandbox --overlay "$project:$upper:$work:/workspace"
+# Run inside COW overlay
+echo '{"id":"1","cmd":"cd /tmp/sandbox/dst && npm install"}' \
+| boxsh --rpc --sandbox --bind cow:"$project:$dst"
 
-# Base is untouched; all changes are in $upper
-ls "$upper"
+# Base is untouched; all changes are in $dst
+ls "$dst"
 # node_modules/  package-lock.json
 ```
 
-The upper directory **persists** across commands within the same boxsh session, and even across sessions if you reuse the same directories. To discard all changes, simply `rm -rf "$upper" "$work"`.
+The destination directory **persists** across commands within the same boxsh session, and even across sessions if you reuse the same directories. To discard all changes, simply `rm -rf "$dst"`.
 
-**Kernel requirements:**
+**Platform-specific requirements for COW:**
 
-- `CONFIG_OVERLAY_FS=y/m`
-- Inside user namespaces (the default): `CONFIG_OVERLAY_FS_METACOPY=y` (Linux ≥ 5.11)
+- **Linux:** `CONFIG_OVERLAY_FS=y/m`; inside user namespaces (the default): `CONFIG_OVERLAY_FS_METACOPY=y` (kernel ≥ 5.11)
+- **macOS:** APFS filesystem (default on macOS ≥ 10.13)
 
 #### Bind Mounts
 
@@ -1039,13 +1018,15 @@ Expose specific host paths inside the sandbox:
 
 ```sh
 # Read-write bind
-boxsh --sandbox --bind /data:/data -c 'ls /data'
+boxsh --sandbox --bind wr:/data -c 'ls /data'
 
 # Read-only bind
-boxsh --sandbox --bind /etc/resolv.conf:/etc/resolv.conf:ro -c 'cat /etc/resolv.conf'
+boxsh --sandbox --bind ro:/etc/resolv.conf -c 'cat /etc/resolv.conf'
 ```
 
-Format: `--bind SRC:DST[:ro]`
+Formats:
+- `--bind ro:PATH` — read-only
+- `--bind wr:PATH` — read-write
 
 
 ### Node.js SDK
@@ -1053,7 +1034,7 @@ Format: `--bind SRC:DST[:ro]`
 The `boxsh.js` SDK provides a high-level client for Node.js applications.
 
 ```sh
-npm install ./sdk/js
+npm install boxsh.js
 ```
 
 #### Quick start
@@ -1073,27 +1054,23 @@ await client.close();
 import { BoxshClient, getChanges, formatChanges } from 'boxsh.js';
 import fs from 'node:fs';
 
-const upper = '/tmp/sandbox/upper';
-const work  = '/tmp/sandbox/work';
-const mnt   = '/tmp/sandbox/mnt';
-fs.mkdirSync(upper, { recursive: true });
-fs.mkdirSync(work,  { recursive: true });
-fs.mkdirSync(mnt,   { recursive: true });
+const dst = '/tmp/sandbox/dst';
+fs.mkdirSync(dst, { recursive: true });
 
 const client = new BoxshClient({
     sandbox: true,
-    overlay: { lower: '/home/user/myproject', upper, work, dst: mnt },
+    binds: [{ mode: 'cow', src: '/home/user/myproject', dst }],
 });
 
 // Run commands inside the sandbox
-await client.exec('npm install', mnt);
+await client.exec('npm install', dst);
 
 // Read/write files via built-in tools (no shell round-trip)
-const pkg = await client.read(`${mnt}/package.json`);
-await client.write(`${mnt}/notes.txt`, 'done\n');
+const pkg = await client.read(`${dst}/package.json`);
+await client.write(`${dst}/notes.txt`, 'done\n');
 
 // Edit files with search-and-replace
-const { diff } = await client.edit(`${mnt}/config.js`, [
+const { diff } = await client.edit(`${dst}/config.js`, [
     { oldText: 'DEBUG = false', newText: 'DEBUG = true' },
 ]);
 console.log(diff);
@@ -1101,7 +1078,7 @@ console.log(diff);
 await client.close();
 
 // Inspect what changed
-const changes = getChanges({ upper, base: '/home/user/myproject' });
+const changes = getChanges({ upper: dst, base: '/home/user/myproject' });
 console.log(formatChanges(changes));
 // M  package-lock.json
 // A  node_modules/
@@ -1134,8 +1111,7 @@ await client.close();
 | `workers` | `number` | `1` | Parallel worker count |
 | `sandbox` | `boolean` | `false` | Enable namespace isolation |
 | `newNetNs` | `boolean` | `false` | Isolate network |
-| `newPidNs` | `boolean` | `false` | Isolate PID tree |
-| `overlay` | `{ lower, upper, work, dst }` | — | Overlay mount config |
+| `binds` | `BoxshBindOption[]` | — | Bind mount configuration (ro/wr/cow) |
 
 #### Methods
 
@@ -1153,5 +1129,5 @@ await client.close();
 | Function | Description |
 |---|---|
 | `shellQuote(s)` | POSIX single-quote escaping for safe command interpolation |
-| `getChanges({ upper, base })` | Scan overlay upper dir for added/modified/deleted files |
+| `getChanges({ upper, base })` | Scan COW destination dir for added/modified/deleted files |
 | `formatChanges(changes)` | Format change list as `A/M/D\tpath` text |

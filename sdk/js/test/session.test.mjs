@@ -31,25 +31,23 @@ describe('BoxshClient — overlay sandbox', () => {
     });
 
     /**
-     * Create a BoxshClient backed by a fresh overlay on top of baseDir.
-     * Also returns the upperDir for assertions.
-     * @param {string} id  Unique label for the overlay directories.
+     * Create a BoxshClient backed by a fresh COW bind on top of baseDir.
+     * Also returns the dstDir for assertions.
+     * @param {string} id  Unique label for the COW directories.
      */
     function makeClient(id) {
-        const dir      = path.join(tmpDir, id);
-        const upperDir = path.join(dir, 'upper');
-        const workDir  = path.join(dir, 'work');
-        fs.mkdirSync(upperDir, { recursive: true });
-        fs.mkdirSync(workDir,  { recursive: true });
+        const dir    = path.join(tmpDir, id);
+        const dstDir = path.join(dir, 'dst');
+        fs.mkdirSync(dstDir, { recursive: true });
 
         const client = new BoxshClient({
             boxshPath: BOXSH,
             workers:   1,
             sandbox:   true,
-            overlay:   { lower: baseDir, upper: upperDir, work: workDir, dst: '/workspace' },
+            binds:     [{ mode: 'cow', src: baseDir, dst: dstDir }],
         });
 
-        return { client, upperDir };
+        return { client, upperDir: dstDir, cwd: dstDir };
     }
 
     // =========================================================
@@ -57,57 +55,57 @@ describe('BoxshClient — overlay sandbox', () => {
     // =========================================================
     describe('Shell — basic commands', () => {
         it('should execute echo command', async () => {
-            const { client } = makeClient('bash-echo');
-            const result = await client.exec('echo "hello session"', '/workspace');
+            const { client, cwd } = makeClient('bash-echo');
+            const result = await client.exec('echo "hello session"', cwd);
             assert.equal(result.exitCode, 0);
             assert.ok(result.stdout.includes('hello session'));
             await client.close();
         });
 
         it('should execute ls and list base files', async () => {
-            const { client } = makeClient('bash-ls');
-            const result = await client.exec('ls', '/workspace');
+            const { client, cwd } = makeClient('bash-ls');
+            const result = await client.exec('ls', cwd);
             assert.ok(result.stdout.includes('README.md'));
             assert.ok(result.stdout.includes('src'));
             await client.close();
         });
 
         it('should execute cat on base file', async () => {
-            const { client } = makeClient('bash-cat');
-            const result = await client.exec('cat README.md', '/workspace');
+            const { client, cwd } = makeClient('bash-cat');
+            const result = await client.exec('cat README.md', cwd);
             assert.ok(result.stdout.includes('# Project'));
             await client.close();
         });
 
         it('should execute grep and find matches', async () => {
-            const { client } = makeClient('bash-grep');
-            const result = await client.exec('grep -n "export" src/utils.ts', '/workspace');
+            const { client, cwd } = makeClient('bash-grep');
+            const result = await client.exec('grep -n "export" src/utils.ts', cwd);
             assert.equal(result.exitCode, 0);
             assert.ok(result.stdout.includes('export const x'));
             await client.close();
         });
 
         it('should execute wc -l', async () => {
-            const { client } = makeClient('bash-wc');
-            const result = await client.exec('wc -l src/utils.ts', '/workspace');
+            const { client, cwd } = makeClient('bash-wc');
+            const result = await client.exec('wc -l src/utils.ts', cwd);
             assert.equal(result.exitCode, 0);
             assert.ok(result.stdout.includes('3'));
             await client.close();
         });
 
         it('should execute head', async () => {
-            const { client } = makeClient('bash-head');
-            const result = await client.exec('head -n 1 src/utils.ts', '/workspace');
+            const { client, cwd } = makeClient('bash-head');
+            const result = await client.exec('head -n 1 src/utils.ts', cwd);
             assert.equal(result.exitCode, 0);
             assert.ok(result.stdout.trim().includes('export const x = 1'));
             await client.close();
         });
 
         it('should execute pipeline', async () => {
-            const { client } = makeClient('bash-pipe');
+            const { client, cwd } = makeClient('bash-pipe');
             const result = await client.exec(
                 'cat src/utils.ts | grep "export" | wc -l',
-                '/workspace',
+                cwd,
             );
             assert.equal(result.exitCode, 0);
             assert.ok(result.stdout.trim() === '3');
@@ -115,8 +113,8 @@ describe('BoxshClient — overlay sandbox', () => {
         });
 
         it('should execute find', async () => {
-            const { client } = makeClient('bash-find');
-            const result = await client.exec('find src -name "*.ts"', '/workspace');
+            const { client, cwd } = makeClient('bash-find');
+            const result = await client.exec('find src -name "*.ts"', cwd);
             assert.equal(result.exitCode, 0);
             assert.ok(result.stdout.includes('index.ts'));
             assert.ok(result.stdout.includes('utils.ts'));
@@ -124,8 +122,8 @@ describe('BoxshClient — overlay sandbox', () => {
         });
 
         it('should cd into subdir and list files', async () => {
-            const { client } = makeClient('bash-cd');
-            const result = await client.exec('cd src && ls', '/workspace');
+            const { client, cwd } = makeClient('bash-cd');
+            const result = await client.exec('cd src && ls', cwd);
             assert.equal(result.exitCode, 0);
             assert.ok(result.stdout.includes('index.ts'));
             await client.close();
@@ -136,19 +134,19 @@ describe('BoxshClient — overlay sandbox', () => {
     // Shell write operations — COW semantics through boxsh
     // =========================================================
     describe('Shell — COW write operations', () => {
-        it('should execute mkdir in overlay', async () => {
-            const { client, upperDir } = makeClient('bash-mkdir');
-            const result = await client.exec('mkdir -p new-dir', '/workspace');
+        it('should execute mkdir in cow layer', async () => {
+            const { client, upperDir, cwd } = makeClient('bash-mkdir');
+            const result = await client.exec('mkdir -p new-dir', cwd);
             assert.equal(result.exitCode, 0);
             assert.ok(fs.existsSync(path.join(upperDir, 'new-dir')));
             await client.close();
         });
 
-        it('should write file via redirect into upper layer', async () => {
-            const { client, upperDir } = makeClient('bash-redir');
+        it('should write file via redirect into dst layer', async () => {
+            const { client, upperDir, cwd } = makeClient('bash-redir');
             const result = await client.exec(
                 'echo "redirected content" > output.txt',
-                '/workspace',
+                cwd,
             );
             assert.equal(result.exitCode, 0);
             const content = fs.readFileSync(path.join(upperDir, 'output.txt'), 'utf-8');
@@ -158,38 +156,38 @@ describe('BoxshClient — overlay sandbox', () => {
         });
 
         it('should read back written content via shell', async () => {
-            const { client } = makeClient('cow-readback');
-            await client.exec('echo "new data" > created.txt', '/workspace');
-            const result = await client.exec('cat created.txt', '/workspace');
+            const { client, cwd } = makeClient('cow-readback');
+            await client.exec('echo "new data" > created.txt', cwd);
+            const result = await client.exec('cat created.txt', cwd);
             assert.ok(result.stdout.includes('new data'));
             await client.close();
         });
 
         it('should show new files in ls after write', async () => {
-            const { client } = makeClient('cow-ls');
-            await client.exec('echo "x" > extra.txt', '/workspace');
-            const result = await client.exec('ls', '/workspace');
+            const { client, cwd } = makeClient('cow-ls');
+            await client.exec('echo "x" > extra.txt', cwd);
+            const result = await client.exec('ls', cwd);
             assert.ok(result.stdout.includes('extra.txt'));
             assert.ok(result.stdout.includes('README.md'));
             await client.close();
         });
 
         it('should detect changes after shell write', async () => {
-            const { client, upperDir } = makeClient('cow-changes');
-            await client.exec('echo "new" > new-file.txt', '/workspace');
+            const { client, upperDir, cwd } = makeClient('cow-changes');
+            await client.exec('echo "new" > new-file.txt', cwd);
             const changes = getChanges({ upper: upperDir, base: baseDir });
             assert.ok(changes.some((c) => c.path === 'new-file.txt' && c.type === 'added'));
             await client.close();
         });
 
         it('should not modify base when writing through shell', async () => {
-            const { client } = makeClient('cow-base');
-            await client.exec('echo "modified" > README.md', '/workspace');
+            const { client, cwd } = makeClient('cow-base');
+            await client.exec('echo "modified" > README.md', cwd);
             assert.equal(
                 fs.readFileSync(path.join(baseDir, 'README.md'), 'utf-8'),
                 '# Project\n',
             );
-            const result = await client.exec('cat README.md', '/workspace');
+            const result = await client.exec('cat README.md', cwd);
             assert.ok(result.stdout.includes('modified'));
             await client.close();
         });
@@ -203,13 +201,13 @@ describe('BoxshClient — overlay sandbox', () => {
             const a = makeClient('bash-iso-a');
             const b = makeClient('bash-iso-b');
 
-            await a.client.exec('echo "a data" > a-file.txt', '/workspace');
-            await b.client.exec('echo "b data" > b-file.txt', '/workspace');
+            await a.client.exec('echo "a data" > a-file.txt', a.cwd);
+            await b.client.exec('echo "b data" > b-file.txt', b.cwd);
 
-            const ra = await a.client.exec('cat b-file.txt 2>/dev/null || true', '/workspace');
+            const ra = await a.client.exec('cat b-file.txt 2>/dev/null || true', a.cwd);
             assert.ok(!ra.stdout.includes('b data'));
 
-            const rb = await b.client.exec('cat b-file.txt', '/workspace');
+            const rb = await b.client.exec('cat b-file.txt', b.cwd);
             assert.ok(rb.stdout.includes('b data'));
 
             assert.equal(fs.existsSync(path.join(a.upperDir, 'b-file.txt')), false);

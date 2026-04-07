@@ -2,13 +2,13 @@
 
 A sandboxed POSIX shell with a concurrent JSON-line RPC mode, built on [dash 0.5.12](http://gondor.apana.org.au/~herbert/dash/).
 
-boxsh is designed as a **programmable execution substrate** — a backend that an AI agent, build system, or orchestration layer can drive over a simple JSON protocol, with Linux namespace isolation baked in. The core use cases it is built for:
+boxsh is designed as a **programmable execution substrate** — a backend that an AI agent, build system, or orchestration layer can drive over a simple JSON protocol, with OS-native sandbox isolation baked in. The core use cases it is built for:
 
 - **AI agent command sandbox** — give an agent a worker that can run arbitrary shell commands while constraining exactly what it can see and modify: mount only the directories it needs, block outbound network, isolate its PID tree.
-- **Zero-cost directory forking** — overlay any directory as a copy-on-write workspace. The agent reads and writes freely; at the end of a session you inspect the diff in the upper layer and decide whether to commit or discard — no git index required, works on any directory.
-- **Session checkpointing and branching** — freeze the current session's upper layer, stack new overlays on top to branch in two directions from the same point, and compare the results. You can also archive the upper layer for long-term storage.
-- **Parallel isolated workers** — share one large read-only base (a node_modules tree, a Python venv, a compiled sysroot) across many workers, each with its own writable upper layer, all running concurrently without interfering.
-- **Deployment / migration dry-runs** — run `make install`, a database migration, or a package upgrade on an overlay, inspect exactly which files changed in the upper layer, then decide whether to apply the change for real.
+- **Zero-cost directory forking** — overlay any directory as a copy-on-write workspace. The agent reads and writes freely; at the end of a session you inspect the diff in the destination directory and decide whether to commit or discard — no git index required, works on any directory.
+- **Session checkpointing and branching** — freeze the current session's destination directory, stack new overlays on top to branch in two directions from the same point, and compare the results. You can also archive the destination directory for long-term storage.
+- **Parallel isolated workers** — share one large read-only base (a node_modules tree, a Python venv, a compiled sysroot) across many workers, each with its own writable destination directory, all running concurrently without interfering.
+- **Deployment / migration dry-runs** — run `make install`, a database migration, or a package upgrade on a COW overlay, inspect exactly which files changed in the destination directory, then decide whether to apply the change for real.
 
 For a scenario-driven walkthrough with examples, see the **[Usage Guide](docs/usage.md)**.
 
@@ -18,8 +18,8 @@ For a scenario-driven walkthrough with examples, see the **[Usage Guide](docs/us
 
 | Feature | Details |
 |---|---|
-| **Linux namespace sandbox** | User, mount, network, and PID namespaces via direct syscalls — no external tools (`bwrap`, `newuidmap`) required |
-| **Overlay filesystem** | Copy-on-write workspace over any read-only base; writes accumulate in a caller-managed upper layer and persist between commands |
+| **OS-native sandbox** | Linux: user/mount/network namespaces via direct syscalls; macOS: Seatbelt (sandbox_init) + SBPL profiles — no external tools required |
+| **Overlay filesystem** | Copy-on-write workspace over any read-only base; writes accumulate in a caller-managed destination directory and persist between commands |
 | **Built-in file tools** | `read` (with offset/limit), `write`, and `edit` (multi-replacement matched against the original file, producing a unified diff) run on background threads — the event loop is never blocked |
 | **JSON-line RPC** | Line-delimited JSON over stdin/stdout; responses stream back out of order as workers finish |
 | **Pre-forked worker pool** | Configurable number of workers (`--workers N`); each worker is forked once and reused across requests |
@@ -27,7 +27,7 @@ For a scenario-driven walkthrough with examples, see the **[Usage Guide](docs/us
 | **Per-request timeout** | `"timeout"` field in the request; enforced via `alarm(2)` inside the worker |
 | **Bind mounts** | Selectively expose host paths (read-write or read-only) inside the sandbox |
 | **Drop-in `/bin/sh`** | Shell mode delegates to embedded dash 0.5.12 — any script or flag that works with POSIX sh works here |
-| **Single static binary** | dash, nlohmann/json, and libedit are vendored; the only runtime dependency is the Linux kernel |
+| **Single static binary** | dash, nlohmann/json, and libedit are vendored; no runtime dependencies beyond the OS kernel |
 
 ---
 
@@ -37,17 +37,17 @@ boxsh has two modes, plus a one-command sandbox shortcut:
 
 | Mode | How to start | What it does |
 |---|---|---|
-| **Quick-try shell** | `boxsh --try` | Drop into a sandboxed root shell on your CWD; writes go to a temp upper layer — original directory untouched |
+| **Quick-try shell** | `boxsh --try` | Drop into a sandboxed root shell on your CWD; writes go to a temp directory — original directory untouched |
 | **Shell mode** | `boxsh` (default) | Drop-in `dash` replacement — interactive shell, `-c`, script files |
 | **RPC mode** | `boxsh --rpc` | Reads JSON requests from stdin, executes shell commands concurrently via a pre-forked worker pool, writes JSON responses to stdout |
 
-In either mode, an optional Linux namespace sandbox can be enabled with `--sandbox`.
+In either mode, an optional OS-native sandbox can be enabled with `--sandbox`.
 
 ---
 
 ## Building
 
-**Requirements:** CMake ≥ 3.16, GCC or Clang (C11 / C++17), Linux kernel ≥ 3.8.
+**Requirements:** CMake ≥ 3.16, GCC or Clang (C11 / C++17). Supported platforms: Linux (kernel ≥ 3.8) and macOS (≥ 10.12).
 
 ```sh
 cmake -B build
@@ -66,21 +66,21 @@ cd my-project
 boxsh --try
 ```
 
-This drops you into a **root shell inside a copy-on-write sandbox** over your current directory. Writes go to a temporary upper layer; your real directory is never modified.
+This drops you into a **root shell inside a copy-on-write sandbox** over your current directory. Writes go to a temporary directory; your real directory is never modified.
 
 ```
 $ boxsh --try
-boxsh: changes will be saved in /tmp/boxsh-try-abc123/upper
+boxsh: changes will be saved in /tmp/boxsh-try-abc123/work
 # <sandboxed root shell — experiment freely>
 $ rm important-file.txt
 $ exit
 $ ls important-file.txt   # still here on the host
 important-file.txt
-$ ls /tmp/boxsh-try-abc123/upper/
+$ ls /tmp/boxsh-try-abc123/work/
 .wh.important-file.txt   # the whiteout lives here, not in your directory
 ```
 
-The temp directory persists after exit so you can inspect or archive exactly what changed. `--try` is shorthand for `--sandbox --overlay CWD:upper:work:CWD` with auto-managed directories. See [Quick-try Mode](docs/usage.md#quick-try-mode) for the full reference.
+The temp directory persists after exit so you can inspect or archive exactly what changed. `--try` is shorthand for `--sandbox --bind cow:CWD:<tmpdir>/work` with auto-managed directories. See [Quick-try Mode](docs/usage.md#quick-try-mode) for the full reference.
 
 ---
 
@@ -295,53 +295,51 @@ RPC options:
 
 Sandbox options (applied in both shell mode and RPC mode):
   --sandbox            Enable the sandbox.
-  --no-user-ns         Skip creating a new user namespace (requires root for other ns).
   --new-net-ns         Create a new network namespace (loopback only).
-  --new-pid-ns         Create a new PID namespace.
-  --bind SRC:DST[:ro]  Bind-mount SRC at DST inside the sandbox.
-                       Append :ro for a read-only bind.
-  --overlay LOWER:UPPER:WORK:DST
-                       Mount an overlayfs at DST. LOWER is the read-only base
-                       layer; UPPER/WORK are caller-managed host directories.
-                       Writes land in UPPER and persist across commands.
-  --proc DST           Mount procfs at DST inside the sandbox.
-  --tmpfs DST[:OPTS]   Mount a fresh empty tmpfs at DST (e.g. size=128m).
+  --bind ro:PATH       Expose PATH read-only inside the sandbox.
+  --bind wr:PATH       Expose PATH read-write inside the sandbox.
+  --bind cow:SRC:DST   Mount an overlayfs at DST with SRC as the read-only
+                       base.  Writes go to DST (the upper layer); SRC is
+                       never modified.  DST must exist before launch.
+
+Quick-try mode:
+  --try                Launch a sandboxed shell on the current directory.
+                       Mounts the current directory as a copy-on-write overlay
+                       so all writes are captured in a temporary directory.
 ```
 
 ---
 
 ## Sandbox
 
-Pass `--sandbox` to enable Linux namespace isolation. The sandbox is applied once per worker at fork time (RPC mode) or immediately before the shell starts (shell mode).
+Pass `--sandbox` to enable OS-native sandbox isolation. The sandbox is applied once per worker at fork time (RPC mode) or immediately before the shell starts (shell mode).
 
 ```sh
 # RPC mode — all workers share the same isolated environment
 boxsh --rpc --workers 4 --sandbox --new-net-ns
 
 # Shell mode — sandbox applied before dash starts
-boxsh --sandbox --bind /data:/data -c 'ls /'
+boxsh --sandbox --bind wr:/data -c 'ls /'
 ```
 
 **What each flag does:**
 
-| Flag | Kernel mechanism | Effect |
-|---|---|---|
-| `--sandbox` | `CLONE_NEWUSER` + `CLONE_NEWNS` | User/mount namespace; auto-includes `/usr`, `/proc`, `/dev`, `/tmp`, selected `/etc` files; current UID mapped as root inside |
-| `--new-net-ns` | `CLONE_NEWNET` | Loopback-only; outbound network blocked |
-| `--new-pid-ns` | `CLONE_NEWPID` | Isolated PID tree; host processes not visible |
-| `--bind SRC:DST[:ro]` | `MS_BIND` | Bind-mount a host path into the sandbox |
-| `--overlay LOWER:UPPER:WORK:DST` | `overlayfs` | Writable overlay over a read-only lower layer |
-| `--proc DST` | `proc` | Mount procfs at DST |
-| `--tmpfs DST[:OPTS]` | `tmpfs` | Fresh empty tmpfs at DST |
-
-**Kernel requirements for `--overlay`:**
-
-| Context | Requirement |
+| Flag | Effect |
 |---|---|
-| Running as root (`--no-user-ns`) | `CONFIG_OVERLAY_FS=y/m` |
-| Unprivileged user namespace (default) | `CONFIG_OVERLAY_FS_METACOPY=y` (Linux ≥ 5.11) |
+| `--sandbox` | Isolated environment; auto-includes system directories; current UID mapped as root inside (Linux) |
+| `--new-net-ns` | Loopback-only; outbound network blocked |
+| `--bind ro:PATH` | Expose a host path read-only inside the sandbox |
+| `--bind wr:PATH` | Expose a host path read-write inside the sandbox |
+| `--bind cow:SRC:DST` | Copy-on-write overlay — SRC is read-only, writes go to DST |
 
-The sandbox uses direct Linux syscalls (`unshare(2)`, `mount(2)`, `pivot_root(2)`) — no external tools such as `bwrap` or `newuidmap` are required.
+**Platform implementation details:**
+
+| Platform | Sandbox mechanism | COW mechanism |
+|---|---|---|
+| Linux | User/mount namespaces (`unshare`, `pivot_root`) | overlayfs (kernel ≥ 5.11 for user-ns) |
+| macOS | Seatbelt (`sandbox_init` + SBPL) | `clonefile(2)` on APFS |
+
+No external tools such as `bwrap` or `newuidmap` are required on any platform.
 
 ---
 
@@ -349,7 +347,7 @@ The sandbox uses direct Linux syscalls (`unshare(2)`, `mount(2)`, `pivot_root(2)
 
 RPC-mode workers are forked at startup before the event loop begins:
 
-1. Each worker optionally enters the sandbox via `unshare` / `pivot_root`.
+1. Each worker optionally enters the sandbox via OS-native isolation.
 2. Workers communicate with the coordinator over a `socketpair(AF_UNIX, SOCK_STREAM)` using a 4-byte length-prefixed JSON wire format.
 3. To execute a shell command, the worker forks a grandchild with stdout/stderr pipes, waits, then sends the result back.
 4. After returning a result the worker immediately accepts the next request.
@@ -390,7 +388,7 @@ node --test tests/index.test.mjs
 | `worker-pool.test.mjs` | Pool sizing, crash recovery, sequential and batch dispatch |
 | `timeout.test.mjs` | Timeout triggering, post-timeout worker recovery and reuse |
 | `concurrent.test.mjs` | Concurrent correctness, out-of-order responses, isolation, stress |
-| `overlay.test.mjs` | Overlay copy-on-write, delete/whiteout, tmpfs mounts |
+| `overlay.test.mjs` | COW bind mounts, copy-on-write, delete/whiteout |
 | `tools.test.mjs` | Built-in tools: read (offset/limit), write, edit (diff, uniqueness checks) |
 
 ---
@@ -403,7 +401,9 @@ boxsh/
 │   ├── main.cpp              CLI parsing, mode dispatch
 │   ├── rpc.h / rpc.cpp       JSON-line protocol, built-in tools, poll(2) event loop
 │   ├── worker_pool.h / .cpp  Worker lifecycle, IPC, shell command execution
-│   └── sandbox.h / .cpp      Linux namespace sandbox (unshare/mount/pivot_root)
+│   ├── sandbox.h              Platform-neutral sandbox interface
+│   ├── sandbox.cpp            Linux implementation (namespaces/overlayfs)
+│   └── sandbox_darwin.cpp     macOS implementation (Seatbelt/clonefile)
 └── third_party/
     ├── dash-0.5.12/          Vendored dash (compiled as a static library;
     │                         dash_main() called directly in shell mode)

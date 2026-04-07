@@ -4,6 +4,7 @@
 #include <cstring>
 #include <cstdio>
 #include <cstdlib>
+#include <vector>
 
 #include <fcntl.h>
 #include <unistd.h>
@@ -142,84 +143,11 @@ static bool mount_overlay_at(const std::string &lowerdir,
     return false;
 }
 
-// Apply overlay mounts inside new_root.  dest_prefix is the new root path.
-//
-// Kernel requirements:
-//   - CLONE_NEWNS must already be active (mount namespace isolation).
-//   - To work inside a CLONE_NEWUSER namespace, the kernel must have
-//     CONFIG_OVERLAY_FS_METACOPY=y (Linux >= 5.11).  Without it the call
-//     fails with EPERM/EINVAL.
-//   - When running as real root (--no-user-ns), standard kernel overlayfs
-//     (CONFIG_OVERLAY_FS=y/m) is sufficient.
-// Return the parent directory of an absolute path (empty string for root).
+// Return the parent directory of an absolute path.
 static std::string path_parent(const std::string &p) {
     size_t pos = p.rfind('/');
     if (pos == std::string::npos || pos == 0) return "/";
     return p.substr(0, pos);
-}
-
-static bool apply_overlay_mounts(const std::vector<OverlayMount> &overlays,
-                                  const std::string &dest_prefix,
-                                  std::string &err) {
-    for (const auto &ov : overlays) {
-        std::string dest = dest_prefix + ov.container_path;
-
-        // Hide overlay internals (lower/upper/work) from inside the sandbox.
-        // If upper and work share a common parent directory that happens to be
-        // accessible in the sandbox (e.g. via the CWD auto-bind), mount a fresh
-        // empty tmpfs on that parent BEFORE mounting the overlay.  This makes
-        // lower/upper/work truly non-existent (ENOENT) inside the sandbox rather
-        // than merely empty directories, which is the correct security boundary.
-        // We do this *before* mount_overlay_at so the overlay mount point (dst)
-        // can be created inside the fresh tmpfs when it falls under that parent.
-        //
-        // Note: the kernel's overlayfs module holds its own internal references
-        // to lowerdir/upperdir/workdir obtained at mount time via the host-path
-        // options string; shadowing those paths in userspace does not affect the
-        // overlay's operation.
-        {
-            std::string p_upper = path_parent(ov.upperdir);
-            std::string p_work  = path_parent(ov.workdir);
-            // Only apply when upper and work share a common, non-root parent that
-            // is distinct from the container_path itself.
-            if (p_upper == p_work && p_upper != "/" &&
-                p_upper != ov.container_path) {
-                std::string base_in_root = dest_prefix + p_upper;
-                struct stat st;
-                if (stat(base_in_root.c_str(), &st) == 0 && S_ISDIR(st.st_mode)) {
-                    if (mount("tmpfs", base_in_root.c_str(), "tmpfs",
-                              MS_NOSUID | MS_NODEV, "mode=0755") == 0) {
-                        // If dst is a child of this base, create its directory
-                        // inside the fresh tmpfs so mount_overlay_at has a target.
-                        if (ov.container_path.size() > p_upper.size() + 1 &&
-                            ov.container_path.compare(0, p_upper.size() + 1,
-                                                      p_upper + "/") == 0) {
-                            std::string dst_err;
-                            mkdir_p(dest, 0755, dst_err);
-                        }
-                    }
-                }
-            }
-        }
-
-        if (!mount_overlay_at(ov.lowerdir, dest, ov.upperdir, ov.workdir,
-                             dest_prefix, err))
-            return false;
-    }
-    return true;
-}
-
-// Mount a proc filesystem at 'path', creating the directory if needed.
-static bool mount_proc(const std::string &path, std::string &err) {
-    if (mkdir(path.c_str(), 0755) != 0 && errno != EEXIST) {
-        err = errno_str(("mkdir proc target: " + path).c_str());
-        return false;
-    }
-    if (mount("proc", path.c_str(), "proc", 0, nullptr) != 0) {
-        err = errno_str(("mount proc -> " + path).c_str());
-        return false;
-    }
-    return true;
 }
 
 // Mount a tmpfs at 'path', creating the directory if needed.
@@ -373,10 +301,14 @@ SandboxResult sandbox_apply(const SandboxConfig &cfg) {
     std::string saved_cwd = cwd_buf ? cwd_buf : "/";
     free(cwd_buf);
 
+    // Capture host uid/gid before unshare — after CLONE_NEWUSER the real
+    // ids are no longer visible.  These are Linux-specific and not part of
+    // the platform-neutral SandboxConfig.
+    uint32_t host_uid = (uint32_t)getuid();
+    uint32_t host_gid = (uint32_t)getgid();
+
     // --- 1. Unshare namespaces ---
-    int unshare_flags = CLONE_NEWNS; // always need a private mount namespace
-    if (cfg.new_user_ns) unshare_flags |= CLONE_NEWUSER;
-    if (cfg.new_pid_ns)  unshare_flags |= CLONE_NEWPID;
+    int unshare_flags = CLONE_NEWNS | CLONE_NEWUSER;
     if (cfg.new_net_ns)  unshare_flags |= CLONE_NEWNET;
 
     if (unshare(unshare_flags) != 0) {
@@ -386,16 +318,16 @@ SandboxResult sandbox_apply(const SandboxConfig &cfg) {
 
     // --- 2. Write uid/gid mapping ---
     // When called via unshare() (no separate fork) we write the map ourselves.
-    if (cfg.new_user_ns) {
+    {
         char self_setgroups[] = "/proc/self/setgroups";
         write_file(self_setgroups, "deny");
 
         char uid_map_content[64];
         char gid_map_content[64];
         std::snprintf(uid_map_content, sizeof(uid_map_content),
-                      "0 %u 1\n", cfg.host_uid);
+                      "0 %u 1\n", host_uid);
         std::snprintf(gid_map_content, sizeof(gid_map_content),
-                      "0 %u 1\n", cfg.host_gid);
+                      "0 %u 1\n", host_gid);
 
         if (!write_file("/proc/self/uid_map", uid_map_content)) {
             res.error = errno_str("write uid_map");
@@ -430,29 +362,18 @@ SandboxResult sandbox_apply(const SandboxConfig &cfg) {
     // --- 5. Automatic read-only system mounts ---
     if (!setup_system_mounts(new_root, res.error)) return res;
 
-    // --- 6. User-specified bind mounts ---
+    // --- 6. User-specified RO/RW bind mounts ---
     for (const auto &bm : cfg.bind_mounts) {
-        std::string dst = new_root + bm.container_path;
-        if (!bind_mount(bm.host_path, dst, bm.readonly, res.error))
+        if (bm.mode == BindMount::Mode::COW) continue;
+        bool readonly = (bm.mode == BindMount::Mode::RO);
+        if (!bind_mount(bm.src, new_root + bm.dst, readonly, res.error))
             return res;
     }
 
-    // --- 7. User-specified extra tmpfs mounts ---
-    for (const auto &tm : cfg.tmpfs_mounts) {
-        if (!mount_tmpfs_at(new_root + tm.container_path, tm.options, res.error))
-            return res;
-    }
-
-    // --- 8. User-specified proc mounts ---
-    for (const auto &pm : cfg.proc_mounts) {
-        if (!mount_proc(new_root + pm.container_path, res.error))
-            return res;
-    }
-
-    // --- 8b. Auto-bind CWD into the new root (if not already covered) ---
+    // --- 7. Auto-bind CWD into the new root (if not already covered) ---
     // Ensures CWD-relative writes reach the host filesystem.
-    // Overlays in step 9 will shadow this bind if CWD falls under an overlay
-    // mount point, so overlay-based CWD is still correctly captured.
+    // COW mounts handle their own CWD redirection; skip auto-bind when CWD
+    // falls within any COW source (the overlay will cover that path).
     if (!saved_cwd.empty()) {
         auto is_under = [](const std::string &path,
                            const std::string &prefix) -> bool {
@@ -468,20 +389,48 @@ SandboxResult sandbox_apply(const SandboxConfig &cfg) {
         for (auto &p : sys_prefixes)
             if (is_under(saved_cwd, p)) { cwd_covered = true; break; }
         if (!cwd_covered) {
-            for (const auto &bm : cfg.bind_mounts)
-                if (is_under(saved_cwd, bm.container_path)) { cwd_covered = true; break; }
+            for (const auto &bm : cfg.bind_mounts) {
+                if (bm.mode == BindMount::Mode::COW) {
+                    // CWD within a COW source will be redirected to dst after pivot.
+                    if (is_under(saved_cwd, bm.src) || is_under(saved_cwd, bm.dst)) {
+                        cwd_covered = true; break;
+                    }
+                } else {
+                    if (is_under(saved_cwd, bm.dst)) { cwd_covered = true; break; }
+                }
+            }
         }
         if (!cwd_covered) {
-            // Best-effort: ignore failures (CWD may be a system path we handle
-            // specially, e.g. /tmp is fresh tmpfs — in that case CWD falls back to /).
+            // Best-effort: ignore failures (CWD may be /tmp which is a fresh tmpfs).
             std::string cwd_err;
             bind_mount(saved_cwd, new_root + saved_cwd, false, cwd_err);
         }
     }
 
-    // --- 9. Overlay mounts (applied inside new_root before pivot_root) ---
-    if (!apply_overlay_mounts(cfg.overlay_mounts, new_root, res.error))
-        return res;
+    // --- 8. COW bind mounts: overlayfs with auto-created workdir ---
+    // dst is used as the upperdir (captures writes); a sibling workdir is
+    // created automatically.  After the sandbox exits, dst on the host holds
+    // the upper layer so the caller can inspect changes.
+    for (const auto &bm : cfg.bind_mounts) {
+        if (bm.mode != BindMount::Mode::COW) continue;
+
+        // Ensure upper layer directory exists on the host.
+        if (!mkdir_p(bm.dst, 0755, res.error)) return res;
+
+        // Auto-create workdir as a sibling of dst (same filesystem as upper).
+        std::string work_tmpl = path_parent(bm.dst) + "/.boxsh-ovl-work-XXXXXX";
+        std::vector<char> work_buf(work_tmpl.begin(), work_tmpl.end());
+        work_buf.push_back('\0');
+        if (!mkdtemp(work_buf.data())) {
+            res.error = errno_str("mkdtemp for COW workdir");
+            return res;
+        }
+        std::string workdir(work_buf.data());
+
+        if (!mount_overlay_at(bm.src, new_root + bm.dst, bm.dst, workdir,
+                              new_root, res.error))
+            return res;
+    }
 
     // --- 10. pivot_root into new_root ---
     // Bind new_root onto itself so it is a mount point (pivot_root requirement).
@@ -515,32 +464,37 @@ SandboxResult sandbox_apply(const SandboxConfig &cfg) {
     }
 
     // --- 11. Restore CWD inside the new root ---
-    // If the old CWD exists inside the new root, go back there.
-    // Otherwise fall back to "/".
-    if (!saved_cwd.empty() && chdir(saved_cwd.c_str()) != 0) {
-        chdir("/");
+    // --- 11. Restore CWD inside the new root ---
+    // For COW mounts: if the old CWD was within a COW source, redirect to
+    // the corresponding dst (the overlay mount point) so the process works
+    // through the overlay.  Otherwise fall back to saved_cwd or "/".
+    {
+        auto is_under = [](const std::string &path,
+                           const std::string &prefix) -> bool {
+            return path == prefix ||
+                   (path.size() > prefix.size() && path[prefix.size()] == '/' &&
+                    path.compare(0, prefix.size(), prefix) == 0);
+        };
+
+        std::string restore_path = saved_cwd;
+        for (const auto &bm : cfg.bind_mounts) {
+            if (bm.mode == BindMount::Mode::COW && is_under(saved_cwd, bm.src)) {
+                if (saved_cwd == bm.src) {
+                    restore_path = bm.dst;
+                } else {
+                    restore_path = bm.dst + saved_cwd.substr(bm.src.size());
+                }
+                break;
+            }
+        }
+
+        if (!restore_path.empty() && chdir(restore_path.c_str()) != 0) {
+            chdir("/");
+        }
     }
 
     res.ok = true;
     return res;
-}
-
-bool sandbox_write_uid_map(pid_t child_pid, uint32_t host_uid,
-                           uint32_t host_gid) {
-    char path[128];
-    char content[64];
-
-    // Deny setgroups first.
-    std::snprintf(path, sizeof(path), "/proc/%d/setgroups", (int)child_pid);
-    write_file(path, "deny"); // best-effort, ignore failure
-
-    std::snprintf(path, sizeof(path), "/proc/%d/uid_map", (int)child_pid);
-    std::snprintf(content, sizeof(content), "0 %u 1\n", host_uid);
-    if (!write_file(path, content)) return false;
-
-    std::snprintf(path, sizeof(path), "/proc/%d/gid_map", (int)child_pid);
-    std::snprintf(content, sizeof(content), "0 %u 1\n", host_gid);
-    return write_file(path, content);
 }
 
 } // namespace boxsh

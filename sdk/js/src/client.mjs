@@ -1,7 +1,7 @@
 /**
  * BoxshClient — manages a long-lived boxsh RPC process.
  *
- * Spawns boxsh with --rpc and optional --sandbox/--overlay flags.
+ * Spawns boxsh with --rpc and optional --sandbox/--bind flags.
  * All commands and tool calls are sent as JSON lines to stdin and
  * responses are read back as JSON lines from stdout.
  *
@@ -44,8 +44,7 @@ export class BoxshClient {
      * @param {number}  [options.workers]     Worker count (default: 1)
      * @param {boolean} [options.sandbox]     Enable --sandbox flag
      * @param {boolean} [options.newNetNs]    Enable --new-net-ns flag
-     * @param {boolean} [options.newPidNs]    Enable --new-pid-ns flag
-     * @param {{ lower: string, upper: string, work: string, dst: string }} [options.overlay]
+     * @param {Array<{ mode: 'ro'|'wr', path: string } | { mode: 'cow', src: string, dst: string }>} [options.binds]
      */
     constructor(options = {}) {
         const boxsh = options.boxshPath ?? process.env['BOXSH'] ??
@@ -54,10 +53,14 @@ export class BoxshClient {
 
         if (options.sandbox) args.push('--sandbox');
         if (options.newNetNs) args.push('--new-net-ns');
-        if (options.newPidNs) args.push('--new-pid-ns');
-        if (options.overlay) {
-            const { lower, upper, work, dst } = options.overlay;
-            args.push('--overlay', `${lower}:${upper}:${work}:${dst}`);
+        if (options.binds) {
+            for (const b of options.binds) {
+                if (b.mode === 'cow') {
+                    args.push('--bind', `cow:${b.src}:${b.dst}`);
+                } else {
+                    args.push('--bind', `${b.mode}:${b.path}`);
+                }
+            }
         }
 
         this.#proc = spawn(boxsh, args, { stdio: ['pipe', 'pipe', 'inherit'] });

@@ -1,17 +1,14 @@
-export interface BoxshOverlayOptions {
-    lower: string;
-    upper: string;
-    work: string;
-    dst: string;
-}
+export type BoxshBindOption =
+    | { mode: 'ro'; path: string }
+    | { mode: 'wr'; path: string }
+    | { mode: 'cow'; src: string; dst: string };
 
 export interface BoxshClientOptions {
     boxshPath?: string;
     workers?: number;
     sandbox?: boolean;
     newNetNs?: boolean;
-    newPidNs?: boolean;
-    overlay?: BoxshOverlayOptions;
+    binds?: BoxshBindOption[];
 }
 
 export interface ExecResult {

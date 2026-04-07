@@ -239,7 +239,9 @@ describe('tool — sandbox isolation', () => {
     }
   });
 
-  test('read tool in sandbox cannot read host-only files', () => {
+  test('read tool in sandbox cannot read host-only files',
+    { skip: process.platform === 'darwin' ? 'macOS lacks mount namespace isolation; host tempdir files remain readable' : false },
+    () => {
     // Write a secret to a path the sandbox exposes only as an isolated /tmp.
     const secret = path.join(os.tmpdir(),
       `boxsh-sandbox-secret-${process.pid}-${Math.random().toString(36).slice(2)}.txt`);

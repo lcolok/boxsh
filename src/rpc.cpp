@@ -393,7 +393,7 @@ void rpc_run_loop(int fd_in, int fd_out, WorkerPool &pool) {
     // already lives inside the sandbox, so no sandbox_apply() is needed here.
     auto dispatch_tool_async = [&](const RpcRequest &req) {
         int sv[2];
-        if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sv) != 0) {
+        if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) {
             // Extremely unlikely (fd exhaustion). Fall back to synchronous execution.
             RpcResponse resp;
             switch (req.tool) {
@@ -405,6 +405,8 @@ void rpc_run_loop(int fd_in, int fd_out, WorkerPool &pool) {
             write_resp(resp);
             return;
         }
+        fcntl(sv[0], F_SETFD, FD_CLOEXEC);
+        fcntl(sv[1], F_SETFD, FD_CLOEXEC);
 
         int write_fd = sv[1];
         std::thread([req, write_fd]() {

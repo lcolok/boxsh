@@ -26,9 +26,11 @@ function tryRun(cwd, cmd, timeout_ms = 5000) {
   });
 }
 
-/** Extract the temp dir path printed by --try to stderr. */
+/** Extract the save directory path printed by --try to stderr.
+ * Returns the full dst path (e.g. /tmp/boxsh-try-XXXXXX/work).
+ * Handles both /tmp/... and /private/tmp/... (macOS symlink resolution). */
 function parseTmpdir(stderr) {
-  const m = stderr.match(/changes will be saved in (\/tmp\/boxsh-try-\S+)\/upper/);
+  const m = stderr.match(/changes will be saved in (\S+)/);
   return m ? m[1] : null;
 }
 
@@ -42,13 +44,15 @@ describe('--try mode', () => {
     try {
       const r = tryRun(cwd, 'true');
       assert.equal(r.status, 0, `non-zero exit: ${r.stderr}`);
-      assert.match(r.stderr, /changes will be saved in \/tmp\/boxsh-try-/);
+      assert.match(r.stderr, /changes will be saved in .+boxsh-try-/);
     } finally {
       spawnSync('rm', ['-rf', cwd]);
     }
   });
 
-  test('appears as root inside the sandbox', () => {
+  test('appears as root inside the sandbox',
+    { skip: process.platform === 'darwin' ? 'Linux user namespaces not available on macOS' : false },
+    () => {
     const cwd = fs.mkdtempSync(path.join(TEMPDIR, 'boxsh-try-'));
     try {
       const r = tryRun(cwd, 'whoami');
@@ -59,12 +63,15 @@ describe('--try mode', () => {
     }
   });
 
-  test('CWD inside sandbox matches launch CWD', () => {
+  test('CWD inside sandbox is the COW work directory', () => {
+    // --try mounts CWD as COW src; the process starts in dst (the merge view).
     const cwd = fs.mkdtempSync(path.join(TEMPDIR, 'boxsh-try-'));
     try {
       const r = tryRun(cwd, 'pwd');
       assert.equal(r.status, 0);
-      assert.equal(r.stdout.trim(), cwd);
+      const dst = parseTmpdir(r.stderr);
+      assert.ok(dst, 'could not parse dst from stderr');
+      assert.equal(r.stdout.trim(), dst);
     } finally {
       spawnSync('rm', ['-rf', cwd]);
     }
@@ -82,8 +89,8 @@ describe('--try mode', () => {
       const tmpdir = parseTmpdir(r.stderr);
       assert.ok(tmpdir, 'could not parse tmpdir from stderr');
 
-      assert.ok(fs.existsSync(path.join(tmpdir, 'upper', 'sandbox-new-file')),
-        'new file must appear in upper layer');
+      assert.ok(fs.existsSync(path.join(tmpdir, 'sandbox-new-file')),
+        'new file must appear in dst (upper layer)');
       assert.ok(!fs.existsSync(path.join(cwd, 'sandbox-new-file')),
         'new file must not appear in real CWD');
     } finally {
@@ -103,9 +110,9 @@ describe('--try mode', () => {
 
       // Original must be untouched.
       assert.equal(fs.readFileSync(path.join(cwd, 'data.txt'), 'utf8'), original);
-      // Modified copy in upper.
+      // Modified copy in dst (upper layer).
       assert.equal(
-        fs.readFileSync(path.join(tmpdir, 'upper', 'data.txt'), 'utf8'),
+        fs.readFileSync(path.join(tmpdir, 'data.txt'), 'utf8'),
         'modified\n',
       );
     } finally {
@@ -125,7 +132,9 @@ describe('--try mode', () => {
     }
   });
 
-  test('file deleted inside sandbox leaves whiteout in upper, original intact', () => {
+  test('file deleted inside sandbox leaves whiteout in upper, original intact',
+    { skip: process.platform === 'darwin' ? 'clonefile COW does not create overlayfs-style whiteout entries' : false },
+    () => {
     const cwd = fs.mkdtempSync(path.join(TEMPDIR, 'boxsh-try-'));
     fs.writeFileSync(path.join(cwd, 'victim.txt'), 'delete me\n');
     try {
@@ -138,9 +147,9 @@ describe('--try mode', () => {
         fs.readFileSync(path.join(cwd, 'victim.txt'), 'utf8'),
         'delete me\n',
       );
-      // Whiteout in upper.
+      // Whiteout in dst (upper layer).
       const tmpdir = parseTmpdir(r.stderr);
-      const wh = fs.statSync(path.join(tmpdir, 'upper', 'victim.txt'));
+      const wh = fs.statSync(path.join(tmpdir, 'victim.txt'));
       assert.ok(wh.isCharacterDevice() && wh.rdev === 0, 'expected whiteout entry');
     } finally {
       spawnSync('rm', ['-rf', cwd]);
@@ -183,7 +192,7 @@ describe('--try mode', () => {
 // Sandbox isolation
 //
 // --sandbox always pivots into a fresh tmpfs root.  Only the paths explicitly
-// mounted (auto system dirs + user --bind/--overlay) are accessible.  Every
+// mounted (auto system dirs + user --bind) are accessible.  Every
 // other path on the host is unreachable from inside.
 //
 // IMPORTANT: Tests in this suite deliberately use os.homedir() for CWD and
@@ -197,7 +206,9 @@ describe('--try mode', () => {
 describe('--try mode — sandbox isolation', () => {
   // ---- /tmp-based siblings (sanity check, passes by fresh-tmpfs isolation) ----
 
-  test('sibling temp dir in /tmp is inaccessible — fresh tmpfs hides it', () => {
+  test('sibling temp dir in /tmp is inaccessible — fresh tmpfs hides it',
+    { skip: process.platform === 'darwin' ? 'macOS lacks tmpfs mount namespace; os.tmpdir() siblings remain visible' : false },
+    () => {
     // Both dirs live in host /tmp.  Sandbox /tmp is fresh tmpfs so sibling is
     // naturally hidden.  This test validates the /tmp isolation mechanism, NOT
     // the overlay isolation.
@@ -218,8 +229,8 @@ describe('--try mode — sandbox isolation', () => {
 
   // ---- $HOME-based siblings (the real-world attack surface) ----
 
-  test('sibling directory under $HOME is readable inside sandbox (COW overlay)', () => {
-    // $HOME is now mounted as a COW overlay, so all directories under $HOME
+  test('sibling directory under $HOME is readable inside sandbox (RO bind)', () => {
+    // $HOME is bind-mounted read-only, so all directories under $HOME
     // (including siblings of CWD) are readable inside the sandbox.
     const HOME    = os.homedir();
     const cwd     = fs.mkdtempSync(path.join(HOME, '.boxsh-test-cwd-'));
@@ -237,9 +248,9 @@ describe('--try mode — sandbox isolation', () => {
     }
   });
 
-  test('sandbox delete in $HOME sibling does not reach host (COW)', () => {
-    // $HOME is a COW overlay: deletes inside the sandbox create whiteout
-    // entries in the upper layer; the real file on the host is untouched.
+  test('sandbox delete in $HOME sibling does not reach host (RO bind)', () => {
+    // $HOME is bind-mounted read-only: deletes inside the sandbox are blocked
+    // with EPERM; the real file on the host is untouched.
     const HOME    = os.homedir();
     const cwd     = fs.mkdtempSync(path.join(HOME, '.boxsh-test-cwd-'));
     const sibling = fs.mkdtempSync(path.join(HOME, '.boxsh-test-sib-'));
@@ -255,9 +266,9 @@ describe('--try mode — sandbox isolation', () => {
     }
   });
 
-  test('sandbox create in $HOME sibling does not reach host (COW)', () => {
-    // New files created inside the sandbox land in the overlay upper layer
-    // and are not visible on the host filesystem.
+  test('sandbox create in $HOME sibling does not reach host (RO bind)', () => {
+    // New files created in $HOME inside the sandbox are blocked with EPERM
+    // (read-only bind); they do not appear on the host filesystem.
     const HOME    = os.homedir();
     const cwd     = fs.mkdtempSync(path.join(HOME, '.boxsh-test-cwd-'));
     const sibling = fs.mkdtempSync(path.join(HOME, '.boxsh-test-sib-'));
@@ -272,9 +283,9 @@ describe('--try mode — sandbox isolation', () => {
     }
   });
 
-  test('sandbox overwrite in $HOME sibling does not reach host (COW)', () => {
-    // Overwrites are captured by the overlay upper layer; the original file
-    // on the host remains unchanged after the sandbox exits.
+  test('sandbox overwrite in $HOME sibling does not reach host (RO bind)', () => {
+    // Overwrites in $HOME inside the sandbox are blocked with EPERM
+    // (read-only bind); the original file on the host remains unchanged.
     const HOME    = os.homedir();
     const cwd     = fs.mkdtempSync(path.join(HOME, '.boxsh-test-cwd-'));
     const sibling = fs.mkdtempSync(path.join(HOME, '.boxsh-test-sib-'));
@@ -308,7 +319,9 @@ describe('--try mode — sandbox isolation', () => {
     }
   });
 
-  test('/usr is auto-included: /usr/bin/ls is accessible', () => {
+  test('/usr is auto-included: /usr/bin/ls is accessible',
+    { skip: process.platform === 'darwin' ? '/usr/bin/ls does not exist on macOS (ls is at /bin/ls)' : false },
+    () => {
     const cwd = fs.mkdtempSync(path.join(TEMPDIR, 'boxsh-try-'));
     try {
       const r = tryRun(cwd, 'ls /usr/bin/ls');
@@ -319,7 +332,9 @@ describe('--try mode — sandbox isolation', () => {
     }
   });
 
-  test('/proc is auto-included: /proc/self/status is readable', () => {
+  test('/proc is auto-included: /proc/self/status is readable',
+    { skip: process.platform === 'darwin' ? '/proc does not exist on macOS' : false },
+    () => {
     const cwd = fs.mkdtempSync(path.join(TEMPDIR, 'boxsh-try-'));
     try {
       const r = tryRun(cwd, 'head -1 /proc/self/status');
@@ -370,7 +385,9 @@ describe('--try mode — sandbox isolation', () => {
     }
   });
 
-  test('/tmp inside sandbox is a fresh tmpfs — host /tmp siblings are not visible', () => {
+  test('/tmp inside sandbox is a fresh tmpfs — host /tmp siblings are not visible',
+    { skip: process.platform === 'darwin' ? 'macOS lacks mount namespace isolation; /tmp writes go to the real filesystem' : false },
+    () => {
     const cwd      = fs.mkdtempSync(path.join(TEMPDIR, 'boxsh-try-'));
     const sentinel = path.join(os.tmpdir(), `boxsh-sentinel-${process.pid}`);
     const probe    = `/tmp/boxsh-sandbox-write-${process.pid}`;
@@ -445,7 +462,9 @@ describe('--try mode — overlay write protection', () => {
     }
   });
 
-  test('sibling directory of CWD is unreadable from inside sandbox', () => {
+  test('sibling directory of CWD is unreadable from inside sandbox',
+    { skip: process.platform === 'darwin' ? 'macOS lacks mount namespace isolation; os.tmpdir() siblings remain readable' : false },
+    () => {
     const cwd     = fs.mkdtempSync(path.join(TEMPDIR, 'boxsh-try-'));
     const sibling = fs.mkdtempSync(path.join(os.tmpdir(), 'boxsh-try-'));
     fs.writeFileSync(path.join(sibling, 'confidential.txt'), 'secret-data');
@@ -577,7 +596,9 @@ describe('--try mode — overlay write protection', () => {
 // ---------------------------------------------------------------------------
 
 describe('--try mode — auto-included system directories', () => {
-  test('/etc is fully accessible (not just selected files)', () => {
+  test('/etc is fully accessible (not just selected files)',
+    { skip: process.platform === 'darwin' ? '/etc/os-release, /etc/ld.so.conf, /etc/hostname are Linux-only files' : false },
+    () => {
     const cwd = fs.mkdtempSync(path.join(TEMPDIR, 'boxsh-try-'));
     try {
       // Verify several /etc files beyond the old allowlist are readable.
@@ -603,7 +624,9 @@ describe('--try mode — auto-included system directories', () => {
     }
   });
 
-  test('/run is accessible', () => {
+  test('/run is accessible',
+    { skip: process.platform === 'darwin' ? '/run does not exist on macOS' : false },
+    () => {
     const cwd = fs.mkdtempSync(path.join(TEMPDIR, 'boxsh-try-'));
     try {
       const r = tryRun(cwd, 'ls /run 2>&1; echo exit:$?');
@@ -625,7 +648,9 @@ describe('--try mode — auto-included system directories', () => {
     }
   });
 
-  test('/var/lib/dpkg/status is readable (dpkg database intact)', () => {
+  test('/var/lib/dpkg/status is readable (dpkg database intact)',
+    { skip: process.platform === 'darwin' ? 'dpkg is not available on macOS' : false },
+    () => {
     const cwd = fs.mkdtempSync(path.join(TEMPDIR, 'boxsh-try-'));
     try {
       const r = tryRun(cwd, 'head -3 /var/lib/dpkg/status 2>&1; echo exit:$?');
@@ -636,7 +661,9 @@ describe('--try mode — auto-included system directories', () => {
     }
   });
 
-  test('dpkg -s reports packages as installed', () => {
+  test('dpkg -s reports packages as installed',
+    { skip: process.platform === 'darwin' ? 'dpkg is not available on macOS' : false },
+    () => {
     // coreutils is always present on a typical Ubuntu host.
     const cwd = fs.mkdtempSync(path.join(TEMPDIR, 'boxsh-try-'));
     try {
@@ -655,14 +682,17 @@ describe('--try mode — auto-included system directories', () => {
         'cat /dev/null && dd if=/dev/zero bs=1 count=1 2>/dev/null | wc -c && dd if=/dev/urandom bs=1 count=1 2>/dev/null | wc -c');
       assert.equal(r.status, 0, `basic /dev nodes not accessible: ${r.stderr}`);
       const lines = r.stdout.trim().split('\n');
-      assert.equal(lines[0], '1', '/dev/zero read failed');
-      assert.equal(lines[1], '1', '/dev/urandom read failed');
+      // wc -c output may have leading spaces on macOS; trim each line.
+      assert.equal(lines[0].trim(), '1', '/dev/zero read failed');
+      assert.equal(lines[1].trim(), '1', '/dev/urandom read failed');
     } finally {
       spawnSync('rm', ['-rf', cwd]);
     }
   });
 
-  test('/dev/pts is mounted (devpts sub-mount present)', () => {
+  test('/dev/pts is mounted (devpts sub-mount present)',
+    { skip: process.platform === 'darwin' ? '/dev/pts (devpts) does not exist on macOS' : false },
+    () => {
     const cwd = fs.mkdtempSync(path.join(TEMPDIR, 'boxsh-try-'));
     try {
       const r = tryRun(cwd, 'ls /dev/pts 2>&1; echo exit:$?');

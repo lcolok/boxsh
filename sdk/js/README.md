@@ -1,15 +1,15 @@
 # boxsh.js
 
-Node.js SDK for [boxsh](../../README.md) — a sandboxed POSIX shell with Linux namespace isolation and copy-on-write overlay filesystem.
+Node.js SDK for [boxsh](../../README.md) — a sandboxed POSIX shell with OS-native isolation and copy-on-write overlay filesystem.
 
 boxsh.js lets you drive a long-lived boxsh instance from Node.js: execute shell commands, read/write files, and perform search-and-replace edits — all inside an isolated sandbox.
 
-**Requirements:** Node.js ≥ 18, Linux, `boxsh` binary on `$PATH` (or set `BOXSH` env var).
+**Requirements:** Node.js ≥ 18, Linux or macOS, `boxsh` binary on `$PATH` (or set `BOXSH` env var).
 
 ## Install
 
 ```sh
-npm install ./sdk/js
+npm install boxsh.js
 ```
 
 ---
@@ -82,72 +82,64 @@ console.log(diff);  // unified diff format
 
 ## Sandbox isolation
 
-With `sandbox` enabled, commands run inside isolated Linux namespaces (user, mount), separated from the host. You can further isolate the network and PID tree:
+With `sandbox` enabled, commands run inside an OS-native sandbox (Linux namespaces or macOS Seatbelt), separated from the host. You can further isolate the network:
 
 ```js
 const client = new BoxshClient({
     sandbox:  true,
     newNetNs: true,   // Isolated network namespace (no external access)
-    newPidNs: true,   // Isolated PID namespace
 });
 ```
 
 ---
 
-## Overlay filesystem
+## COW Bind (Overlay Filesystem)
 
-Overlay is the primary usage pattern for boxsh: mount a read-only base directory as a copy-on-write workspace. Commands can read and write freely, but all modifications land in the upper directory while the base remains untouched.
+COW bind is the primary usage pattern for boxsh: mount a read-only source directory as a copy-on-write workspace. Commands can read and write freely, but all modifications land in the destination directory while the source remains untouched.
 
 ```
-Overlay parameters:
-  lower  Read-only base directory (your project/repository)
-  upper  Writable upper directory (all modifications go here)
-  work   Working directory required by overlayfs (must be on the same filesystem as upper)
-  dst    Mount point (the path visible inside the sandbox)
+Bind parameters:
+  src  Read-only base directory (your project/repository)
+  dst  Writable destination directory (all modifications go here)
 ```
 
 ```js
 import { BoxshClient } from 'boxsh.js';
 import fs from 'node:fs';
 
-// Prepare overlay directories
-const upper = '/tmp/sandbox/upper';
-const work  = '/tmp/sandbox/work';
-const mnt   = '/tmp/sandbox/mnt';
-fs.mkdirSync(upper, { recursive: true });
-fs.mkdirSync(work,  { recursive: true });
-fs.mkdirSync(mnt,   { recursive: true });
+// Prepare destination directory
+const dst = '/tmp/sandbox/dst';
+fs.mkdirSync(dst, { recursive: true });
 
 const client = new BoxshClient({
     sandbox: true,
-    overlay: {
-        lower: '/home/user/myproject',   // read-only base
-        upper,                            // modifications land here
-        work,
-        dst: mnt,                         // mount point inside the sandbox
-    },
+    binds: [{
+        mode: 'cow',
+        src: '/home/user/myproject',   // read-only base
+        dst,                            // modifications land here
+    }],
 });
 
-// Inside the sandbox, /tmp/sandbox/mnt is a COW copy of myproject
-await client.exec('npm install', mnt);
+// Inside the sandbox, dst is a COW copy of myproject
+await client.exec('npm install', dst);
 
 // Read/write files via built-in tools (RPC, no shell round-trip needed)
-const pkg = await client.read(`${mnt}/package.json`);
-await client.write(`${mnt}/result.txt`, 'done\n');
+const pkg = await client.read(`${dst}/package.json`);
+await client.write(`${dst}/result.txt`, 'done\n');
 
 await client.close();
 
-// At this point upper/ contains all modifications; base is completely untouched.
-// You can commit, archive, or simply delete upper/ to discard changes.
+// At this point dst/ contains all modifications; base is completely untouched.
+// You can commit, archive, or simply delete dst/ to discard changes.
 ```
 
-The upper directory persists across sessions. To resume a previous session, create a new BoxshClient pointing at the same `upper`/`work`/`mnt` directories.
+The destination directory persists across sessions. To resume a previous session, create a new BoxshClient pointing at the same `dst` directory.
 
 ---
 
 ## Inspecting changes
 
-`getChanges` scans the overlay's upper directory against the base and returns all added, modified, and deleted files. `formatChanges` formats the result as human-readable text.
+`getChanges` scans the COW destination directory against the base and returns all added, modified, and deleted files. `formatChanges` formats the result as human-readable text.
 
 Both functions run on the host side (inside the Node.js process) and do not require a running boxsh instance.
 
@@ -155,7 +147,7 @@ Both functions run on the host side (inside the Node.js process) and do not requ
 import { getChanges, formatChanges } from 'boxsh.js';
 
 const changes = getChanges({
-    upper: '/tmp/sandbox/upper',
+    upper: '/tmp/sandbox/dst',
     base:  '/home/user/myproject',
 });
 // [{ path: 'package-lock.json', type: 'modified' },
@@ -194,8 +186,7 @@ await client.exec(`echo ${shellQuote(userInput)}`);
 | `workers` | `number` | `1` | Number of pre-forked workers |
 | `sandbox` | `boolean` | `false` | Enable namespace sandbox |
 | `newNetNs` | `boolean` | `false` | Isolate network |
-| `newPidNs` | `boolean` | `false` | Isolate PID tree |
-| `overlay` | `{ lower, upper, work, dst }` | — | Overlay mount configuration |
+| `binds` | `BoxshBindOption[]` | — | Bind mount configuration (ro/wr/cow) |
 
 ### `client.exec(cmd, cwd?, timeout?) → Promise<{ exitCode, stdout, stderr }>`
 
@@ -223,7 +214,7 @@ Send SIGTERM immediately.
 
 ### `getChanges({ upper, base }) → Array<{ path, type }>`
 
-Scan the upper directory and return a list of changes relative to base. `type` is `'added'`, `'modified'`, or `'deleted'`.
+Scan the destination directory and return a list of changes relative to base. `type` is `'added'`, `'modified'`, or `'deleted'`.
 
 ### `formatChanges(changes) → string`
 

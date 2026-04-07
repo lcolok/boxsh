@@ -80,12 +80,14 @@ static void run_shell_command(const std::string &shell_path,
                               std::string &stderr_out,
                               int &exit_code) {
     int pfd_out[2], pfd_err[2];
-    if (pipe2(pfd_out, O_CLOEXEC) != 0 || pipe2(pfd_err, O_CLOEXEC) != 0) {
+    if (pipe(pfd_out) != 0 || pipe(pfd_err) != 0) {
         exit_code = -1;
-        stderr_out = "pipe2 failed: ";
+        stderr_out = "pipe failed: ";
         stderr_out += std::strerror(errno);
         return;
     }
+    fcntl(pfd_out[0], F_SETFD, FD_CLOEXEC); fcntl(pfd_out[1], F_SETFD, FD_CLOEXEC);
+    fcntl(pfd_err[0], F_SETFD, FD_CLOEXEC); fcntl(pfd_err[1], F_SETFD, FD_CLOEXEC);
 
     pid_t child = fork();
     if (child < 0) {
@@ -341,10 +343,12 @@ WorkerPool::~WorkerPool() {
 
 void WorkerPool::spawn_worker(Worker &w) {
     int sv[2];
-    if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sv) != 0) {
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) {
         std::perror("socketpair");
         return;
     }
+    fcntl(sv[0], F_SETFD, FD_CLOEXEC);
+    fcntl(sv[1], F_SETFD, FD_CLOEXEC);
 
     pid_t pid = fork();
     if (pid < 0) {

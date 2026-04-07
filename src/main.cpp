@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <climits>
 #include <string>
 #include <vector>
 
@@ -38,26 +39,20 @@ void print_usage(const char *prog) {
         "  --sandbox      Enable the sandbox.  Builds an isolated root from a fresh\n"
         "                 tmpfs with read-only system directories (/usr, /proc, /dev,\n"
         "                 selected /etc files) automatically mounted.  Everything else\n"
-        "                 is hidden unless explicitly exposed with --bind or --overlay.\n"
-        "  --no-user-ns   Do not create a new user namespace (requires root for other ns).\n"
+        "                 is hidden unless explicitly exposed with --bind.\n"
         "  --new-net-ns   Create a new network namespace (disables outbound network).\n"
-        "  --new-pid-ns   Create a new PID namespace.\n"
-        "  --bind SRC:DST[:ro]  Bind-mount SRC to DST inside the sandbox.\n"
-        "                       Append ':ro' to make it read-only.\n"
-        "  --overlay LOWER:UPPER:WORK:DST\n"
-        "                       Mount overlayfs at DST.  LOWER is the read-only\n"
-        "                       base layer (host path); UPPER and WORK are the\n"
-        "                       writable/work directories managed by the caller\n"
-        "                       (must exist; writes persist between commands).\n"
-        "  --proc DST           Mount procfs at DST inside the sandbox.\n"
-        "  --tmpfs DST[:OPTS]   Mount an empty tmpfs at DST (OPTS: e.g. size=128m).\n"
+        "  --bind ro:PATH       Expose PATH read-only inside the sandbox.\n"
+        "  --bind wr:PATH       Expose PATH read-write inside the sandbox.\n"
+        "  --bind cow:SRC:DST   Mount an overlayfs at DST with SRC as the read-only\n"
+        "                       base.  Writes go to DST (the upper layer); SRC is\n"
+        "                       never modified.  DST must exist before launch.\n"
         "\n"
         "Quick-try mode:\n"
         "  --try          Launch a sandboxed shell on the current directory.\n"
-        "                 Mounts the current directory as a copy-on-write overlay so all\n"
-        "                 writes are captured in a temporary upper layer.  When the shell\n"
-        "                 exits the temp dir path is printed to stderr — inspect upper/\n"
-        "                 to see what changed, then discard when done.\n"
+        "                 Mounts the current directory as a copy-on-write overlay so\n"
+        "                 all writes are captured in a temporary directory.  When the\n"
+        "                 shell exits the temp dir path is printed to stderr — inspect\n"
+        "                 it to see what changed, then discard when done.\n"
         "\n",
         prog);
 }
@@ -71,78 +66,47 @@ struct Cli {
     SandboxConfig sandbox;
 };
 
-// Parse --bind SRC:DST[:ro]
+// Parse --bind ro:PATH | wr:PATH | cow:SRC:DST
 static bool parse_bind(const char *arg, BindMount &bm) {
     std::string s(arg);
-    size_t p1 = s.find(':');
-    if (p1 == std::string::npos) return false;
-    bm.host_path = s.substr(0, p1);
+    size_t colon = s.find(':');
+    if (colon == std::string::npos) return false;
 
-    size_t p2 = s.find(':', p1 + 1);
-    if (p2 == std::string::npos) {
-        bm.container_path = s.substr(p1 + 1);
-        bm.readonly       = false;
-    } else {
-        bm.container_path = s.substr(p1 + 1, p2 - p1 - 1);
-        std::string flag  = s.substr(p2 + 1);
-        bm.readonly       = (flag == "ro");
+    std::string mode_str = s.substr(0, colon);
+    std::string rest     = s.substr(colon + 1);
+
+    if (mode_str == "ro") {
+        bm.mode = BindMount::Mode::RO;
+        bm.src  = rest;
+        bm.dst  = rest;
+        return !rest.empty();
+    } else if (mode_str == "wr") {
+        bm.mode = BindMount::Mode::RW;
+        bm.src  = rest;
+        bm.dst  = rest;
+        return !rest.empty();
+    } else if (mode_str == "cow") {
+        size_t p2 = rest.find(':');
+        if (p2 == std::string::npos) return false;
+        bm.mode = BindMount::Mode::COW;
+        bm.src  = rest.substr(0, p2);
+        bm.dst  = rest.substr(p2 + 1);
+        return !bm.src.empty() && !bm.dst.empty();
     }
-    return !bm.host_path.empty() && !bm.container_path.empty();
-}
-
-// Parse --overlay LOWER:UPPER:WORK:DST
-static bool parse_overlay(const char *arg, OverlayMount &om) {
-    // Format: LOWER:UPPER:WORK:DST
-    // LOWER may contain colons (overlayfs multi-layer lower dirs), so we
-    // parse from the right: DST, WORK, UPPER are each a single segment;
-    // everything left of that is LOWER.
-    std::string s(arg);
-    size_t p3 = s.rfind(':');
-    if (p3 == std::string::npos || p3 == 0) return false;
-    size_t p2 = s.rfind(':', p3 - 1);
-    if (p2 == std::string::npos || p2 == 0) return false;
-    size_t p1 = s.rfind(':', p2 - 1);
-    if (p1 == std::string::npos) return false;
-    om.lowerdir       = s.substr(0, p1);
-    om.upperdir       = s.substr(p1 + 1, p2 - p1 - 1);
-    om.workdir        = s.substr(p2 + 1, p3 - p2 - 1);
-    om.container_path = s.substr(p3 + 1);
-    return !om.lowerdir.empty() && !om.upperdir.empty() &&
-           !om.workdir.empty() && !om.container_path.empty();
-}
-
-// Parse --proc DST
-static ProcMount parse_proc(const char *arg) {
-    return ProcMount{arg};
-}
-
-// Parse --tmpfs DST[:OPTS]
-static TmpfsMount parse_tmpfs(const char *arg) {
-    std::string s(arg);
-    size_t p = s.find(':');
-    if (p == std::string::npos)
-        return TmpfsMount{s, ""};
-    return TmpfsMount{s.substr(0, p), s.substr(p + 1)};
+    return false;
 }
 
 static Cli parse_cli(int argc, char **argv, int &remaining_argc,
                      char **&remaining_argv) {
     Cli cli;
-    cli.sandbox.host_uid = (uint32_t)getuid();
-    cli.sandbox.host_gid = (uint32_t)getgid();
 
     static const struct option opts[] = {
         {"rpc",         no_argument,       nullptr, 'R'},
         {"workers",     required_argument, nullptr, 'W'},
         {"shell",       required_argument, nullptr, 'S'},
         {"sandbox",     no_argument,       nullptr, 'X'},
-        {"no-user-ns",  no_argument,       nullptr, 'U'},
         {"new-net-ns",  no_argument,       nullptr, 'N'},
-        {"new-pid-ns",  no_argument,       nullptr, 'P'},
         {"bind",        required_argument, nullptr, 'b'},
-        {"overlay",     required_argument, nullptr, 'v'},
-        {"proc",        required_argument, nullptr, 'F'},
-        {"tmpfs",       required_argument, nullptr, 'T'},
         {"try",         no_argument,       nullptr, 'y'},
         {"help",        no_argument,       nullptr, 'h'},
         {nullptr, 0, nullptr, 0}
@@ -160,36 +124,19 @@ static Cli parse_cli(int argc, char **argv, int &remaining_argc,
         case 'W': cli.num_workers = std::atoi(optarg); break;
         case 'S': cli.shell_path  = optarg; break;
         case 'X': cli.sandbox.enabled = true; break;
-        case 'U': cli.sandbox.new_user_ns = false; break;
         case 'N': cli.sandbox.new_net_ns  = true; break;
-        case 'P': cli.sandbox.new_pid_ns  = true; break;
         case 'b': {
             BindMount bm;
             if (!parse_bind(optarg, bm)) {
-                std::fprintf(stderr, "boxsh: invalid --bind argument: %s\n",
-                             optarg);
+                std::fprintf(stderr,
+                    "boxsh: invalid --bind argument: %s\n"
+                    "  expected: ro:PATH | wr:PATH | cow:SRC:DST\n",
+                    optarg);
                 std::exit(1);
             }
             cli.sandbox.bind_mounts.push_back(std::move(bm));
             break;
         }
-        case 'v': {
-            OverlayMount om;
-            if (!parse_overlay(optarg, om)) {
-                std::fprintf(stderr,
-                    "boxsh: --overlay requires LOWER:UPPER:WORK:DST, got: %s\n",
-                    optarg);
-                std::exit(1);
-            }
-            cli.sandbox.overlay_mounts.push_back(std::move(om));
-            break;
-        }
-        case 'F':
-            cli.sandbox.proc_mounts.push_back(parse_proc(optarg));
-            break;
-        case 'T':
-            cli.sandbox.tmpfs_mounts.push_back(parse_tmpfs(optarg));
-            break;
         case 'y': cli.try_mode = true; break;
         case 'h':
             print_usage(argv[0]);
@@ -217,7 +164,7 @@ int main(int argc, char **argv) {
 
     boxsh::Cli cli = boxsh::parse_cli(argc, argv, shell_argc, shell_argv);
 
-    // --try: auto-configure sandbox + COW overlay on CWD, then fall through
+    // --try: auto-configure sandbox + COW bind on CWD, then fall through
     // to the normal shell or RPC path unchanged.
     std::string try_cwd;
     if (cli.try_mode) {
@@ -236,19 +183,21 @@ int main(int argc, char **argv) {
                          strerror(errno));
             return 1;
         }
-        std::string try_tmpdir(tmpl);
-        std::string upper = try_tmpdir + "/upper";
-        std::string work  = try_tmpdir + "/work";
-        if (mkdir(upper.c_str(), 0700) != 0 ||
-            mkdir(work.c_str(),  0700) != 0) {
-            std::fprintf(stderr, "boxsh: --try: failed to create temp dirs: %s\n",
+        // Canonicalize /tmp -> /private/tmp (and similar symlinks) so the
+        // printed path matches what getcwd() will report inside the sandbox.
+        char real_tmpl[PATH_MAX];
+        const char *rp = realpath(tmpl, real_tmpl);
+        std::string try_tmpdir = rp ? std::string(rp) : std::string(tmpl);
+        std::string dst = try_tmpdir + "/work";
+        if (mkdir(dst.c_str(), 0700) != 0) {
+            std::fprintf(stderr, "boxsh: --try: failed to create work dir: %s\n",
                          strerror(errno));
             rmdir(try_tmpdir.c_str());
             return 1;
         }
 
-        std::fprintf(stderr, "boxsh: changes will be saved in %s/upper\n",
-                     try_tmpdir.c_str());
+        std::fprintf(stderr, "boxsh: changes will be saved in %s\n",
+                     dst.c_str());
 
         cli.sandbox.enabled = true;
 
@@ -264,29 +213,22 @@ int main(int argc, char **argv) {
         }
 
         // $HOME: bind-mount read-only so it is accessible inside the sandbox
-        // without exposing writes to the host.  We deliberately avoid using
-        // $HOME as an overlayfs lower layer because /home/<user> can have an
-        // XFS inode number > INT32_MAX; overlayfs copy-up then fails with
-        // EOVERFLOW even with xino=off.
+        // without exposing writes to the host.
         if (!home_dir.empty()) {
             boxsh::BindMount hbm;
-            hbm.host_path      = home_dir;
-            hbm.container_path = home_dir;
-            hbm.readonly       = true;
+            hbm.mode = boxsh::BindMount::Mode::RO;
+            hbm.src  = home_dir;
+            hbm.dst  = home_dir;
             cli.sandbox.bind_mounts.push_back(std::move(hbm));
         }
 
-        // Always COW-overlay the CWD.  The overlay lower layer is the CWD
-        // directory itself, whose inode number is always small enough to avoid
-        // EOVERFLOW.  If CWD is inside $HOME the overlay at step 9 shadows the
-        // read-only home bind mount applied in step 6, so writes go to upper.
+        // COW overlay on CWD: process works in dst (the overlay merged view).
         {
-            boxsh::OverlayMount om;
-            om.lowerdir       = try_cwd;
-            om.upperdir       = upper;
-            om.workdir        = work;
-            om.container_path = try_cwd;
-            cli.sandbox.overlay_mounts.push_back(std::move(om));
+            boxsh::BindMount bm;
+            bm.mode = boxsh::BindMount::Mode::COW;
+            bm.src  = try_cwd;
+            bm.dst  = dst;
+            cli.sandbox.bind_mounts.push_back(std::move(bm));
         }
     }
 
