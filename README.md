@@ -45,7 +45,29 @@ In either mode, an optional OS-native sandbox can be enabled with `--sandbox`.
 
 ---
 
-## Building
+## Installation
+
+### One-line install (Linux / macOS)
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/xicilion/boxsh/master/install.sh | sh
+```
+
+This auto-detects your OS and architecture, downloads the latest release binary, and installs it to `/usr/local/bin`.
+
+Options via environment variables:
+
+```sh
+# Install a specific version
+BOXSH_VERSION=v1.0.0 curl -fsSL https://raw.githubusercontent.com/xicilion/boxsh/master/install.sh | sh
+
+# Install to a custom directory
+BOXSH_INSTALL=~/.local/bin curl -fsSL https://raw.githubusercontent.com/xicilion/boxsh/master/install.sh | sh
+```
+
+Supported platforms: Linux (x64, ia32, arm64, arm, mips64, ppc64, riscv64, loong64) and macOS (arm64, x86_64).
+
+### Build from source
 
 **Requirements:** CMake ≥ 3.16, GCC or Clang (C11 / C++17). Supported platforms: Linux (kernel ≥ 3.8) and macOS (≥ 10.12).
 

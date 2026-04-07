@@ -72,5 +72,9 @@ fi
 # Package release
 if [[ "${BUILD_TAG}" != "" ]]; then
     mkdir -p release
-    cp ${BUILD_DIR}/boxsh release/boxsh-${BUILD_TAG}-linux-${BUILD_ARCH}
+    if [[ "${HOST_OS}" == "Darwin" ]]; then
+        cp ${BUILD_DIR}/boxsh release/boxsh-${BUILD_TAG}-darwin-${BUILD_ARCH}
+    else
+        cp ${BUILD_DIR}/boxsh release/boxsh-${BUILD_TAG}-linux-${BUILD_ARCH}
+    fi
 fi
