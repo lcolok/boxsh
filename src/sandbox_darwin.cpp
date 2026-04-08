@@ -6,7 +6,10 @@
 #include <cstdlib>
 #include <cstdint>
 #include <climits>
+#include <atomic>
+#include <chrono>
 #include <string>
+#include <thread>
 
 #include <unistd.h>
 #include <sys/stat.h>
@@ -146,12 +149,49 @@ SandboxResult sandbox_apply(const SandboxConfig &cfg) {
             }
         }
 
-        if (clonefile(bm.src.c_str(), bm.dst.c_str(), 0) != 0) {
-            if (errno == ENOTSUP) {
+        // Show a spinner with elapsed time on stderr so the user knows
+        // the clone is in progress.  The spinner only appears after a
+        // short grace period to avoid flashing on small directories.
+        bool show_progress = isatty(STDERR_FILENO);
+        std::atomic<bool> clone_done{false};
+        std::thread spinner;
+        if (show_progress) {
+            spinner = std::thread([&clone_done, &bm]() {
+                static const char frames[] = "|/-\\";
+                auto start = std::chrono::steady_clock::now();
+                // Wait a short grace period before showing anything.
+                std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                int i = 0;
+                while (!clone_done.load(std::memory_order_relaxed)) {
+                    auto elapsed = std::chrono::duration_cast<
+                        std::chrono::seconds>(
+                            std::chrono::steady_clock::now() - start)
+                        .count();
+                    std::fprintf(stderr,
+                        "\rboxsh: preparing snapshot of %s ... %c  %llds",
+                        bm.src.c_str(), frames[i++ % 4], (long long)elapsed);
+                    std::this_thread::sleep_for(
+                        std::chrono::milliseconds(200));
+                }
+            });
+        }
+
+        int clone_rc = clonefile(bm.src.c_str(), bm.dst.c_str(), 0);
+        int clone_errno = errno;
+        clone_done.store(true, std::memory_order_relaxed);
+        if (spinner.joinable()) spinner.join();
+        if (show_progress) {
+            // Clear the spinner line.
+            std::fprintf(stderr, "\r\033[K");
+        }
+
+        if (clone_rc != 0) {
+            if (clone_errno == ENOTSUP) {
                 res.error = "clonefile: " + bm.src + " -> " + bm.dst
                     + ": filesystem does not support COW cloning"
                       " (APFS volume required)";
             } else {
+                errno = clone_errno;
                 res.error = errno_str(
                     ("clonefile: " + bm.src + " -> " + bm.dst).c_str());
             }
