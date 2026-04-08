@@ -235,7 +235,7 @@ static std::string mcp_initialize_response(const json &id,
         }},
         {"serverInfo", {
             {"name", "boxsh"},
-            {"version", "1.0.0"}
+            {"version", BOXSH_VERSION}
         }}
     };
     return j.dump();

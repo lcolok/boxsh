@@ -23,9 +23,14 @@ extern "C" int dash_main(int argc, char **argv);
 namespace boxsh {
 namespace {
 
+void print_version() {
+    std::fprintf(stderr, "boxsh version %s\n", BOXSH_VERSION);
+}
+
 void print_usage(const char *prog) {
+    print_version();
     std::fprintf(stderr,
-        "Usage: %s [OPTIONS] [-- shell-args...]\n"
+        "\nUsage: %s [OPTIONS] [-- shell-args...]\n"
         "\n"
         "Modes:\n"
         "  (default)      Run as an ordinary POSIX shell (delegates to dash).\n"
@@ -108,6 +113,7 @@ static Cli parse_cli(int argc, char **argv, int &remaining_argc,
         {"new-net-ns",  no_argument,       nullptr, 'N'},
         {"bind",        required_argument, nullptr, 'b'},
         {"try",         no_argument,       nullptr, 'y'},
+        {"version",     no_argument,       nullptr, 'v'},
         {"help",        no_argument,       nullptr, 'h'},
         {nullptr, 0, nullptr, 0}
     };
@@ -138,6 +144,9 @@ static Cli parse_cli(int argc, char **argv, int &remaining_argc,
             break;
         }
         case 'y': cli.try_mode = true; break;
+        case 'v':
+            print_version();
+            std::exit(0);
         case 'h':
             print_usage(argv[0]);
             std::exit(0);
