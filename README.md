@@ -263,6 +263,43 @@ boxsh distinguishes two kinds of errors per the MCP spec:
 
 **Bind modes:** `cow:SRC:DST` (copy-on-write — project is read-only, writes go to DST), `ro:PATH` (read-only), `wr:PATH` (direct read-write). Add `--new-net-ns` to block network access.
 
+### Sandboxing third-party MCP servers
+
+boxsh can wrap **any** MCP server command to sandbox it — no changes to the server itself are required. Simply replace the original `command` with `boxsh` and prepend sandbox flags before `--`:
+
+**Before** (unsandboxed):
+
+```json
+{
+  "servers": {
+    "some-mcp": {
+      "command": "npx",
+      "args": ["-y", "@anthropic/some-mcp-server"]
+    }
+  }
+}
+```
+
+**After** (sandboxed via boxsh):
+
+```json
+{
+  "servers": {
+    "some-mcp": {
+      "command": "boxsh",
+      "args": [
+        "--sandbox",
+        "--bind", "ro:/path/to/project",
+        "--new-net-ns",
+        "--", "npx", "-y", "@anthropic/some-mcp-server"
+      ]
+    }
+  }
+}
+```
+
+boxsh launches the original MCP server inside an isolated namespace. The server still communicates over stdio as usual, but its filesystem and network access are restricted by the sandbox. This works with any MCP server that uses stdio transport.
+
 ### Handshake example
 
 ```sh
