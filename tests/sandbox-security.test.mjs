@@ -166,7 +166,7 @@ describe('Phase 2 — mv/rename bypass prevention', () => {
 // Phase 3 — Network namespace isolation (--new-net-ns)
 // ============================================================================
 
-describe('Phase 3 — Network isolation', { skip: !IS_MACOS }, () => {
+describe('Phase 3 — Network isolation', () => {
 
   test('--new-net-ns blocks outbound TCP connections', () => {
     const r = spawnSync(BOXSH, [
@@ -209,7 +209,7 @@ describe('Phase 3 — Network isolation', { skip: !IS_MACOS }, () => {
 });
 
 // ─── Phase 4: Process lifecycle / orphan cleanup ───────────────────────────
-describe('Phase 4 — Process lifecycle', { skip: IS_LINUX && 'macOS-only sandbox tests' }, () => {
+describe('Phase 4 — Process lifecycle', () => {
   test('background process is reaped after sandbox exits', () => {
     // Launch a long sleep in the background, then exit the sandbox.
     // After the sandbox process terminates, the background sleep should
@@ -259,8 +259,10 @@ describe('Phase 4 — Process lifecycle', { skip: IS_LINUX && 'macOS-only sandbo
 });
 
 // ─── Phase 5: Privilege escalation prevention ──────────────────────────────
-describe('Phase 5 — Privilege escalation prevention', { skip: IS_LINUX && 'macOS-only sandbox tests' }, () => {
-  test('chmod setuid bit is denied by Seatbelt', () => {
+describe('Phase 5 — Privilege escalation prevention', () => {
+  test('chmod setuid bit is denied by Seatbelt',
+    { skip: IS_LINUX && 'Linux user namespaces allow setuid on owned files' },
+    () => {
     const r = tryRun(TEMPDIR,
       'cp /bin/echo ./test_suid && chmod 4755 ./test_suid 2>&1; echo EXIT=$?');
     // Seatbelt should deny the setuid bit change
