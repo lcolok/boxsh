@@ -200,7 +200,7 @@ target_include_directories(boxsh
 target_compile_definitions(boxsh
     PRIVATE
         _GNU_SOURCE
-        BOXSH_VERSION="2.0.0"
+        BOXSH_VERSION="2.0.1"
 )
 
 target_compile_options(boxsh
