@@ -111,8 +111,21 @@ target_include_directories(nlohmann_json INTERFACE
 include(ExternalProject)
 
 set(LIBEDIT_SRC_DIR ${CMAKE_CURRENT_SOURCE_DIR}/third_party/libedit-20230828-3.1)
-set(LIBEDIT_BUILD_DIR ${CMAKE_BINARY_DIR}/libedit-build)
-set(LIBEDIT_INSTALL_DIR ${CMAKE_BINARY_DIR}/libedit-prefix)
+
+# ---------------------------------------------------------------------------
+# Workaround: autotools / libtool do not cope with whitespace in paths.
+# We copy the vendored libedit source and place all build artifacts in a
+# guaranteed space-free temporary directory.
+# ---------------------------------------------------------------------------
+string(MD5 LIBEDIT_SRC_HASH "${LIBEDIT_SRC_DIR}")
+set(LIBEDIT_SPACE_FREE_BASE "/tmp/boxsh-libedit-${LIBEDIT_SRC_HASH}")
+set(LIBEDIT_COPY_DIR    "${LIBEDIT_SPACE_FREE_BASE}/src")
+set(LIBEDIT_BUILD_DIR   "${LIBEDIT_SPACE_FREE_BASE}/build")
+set(LIBEDIT_INSTALL_DIR "${LIBEDIT_SPACE_FREE_BASE}/prefix")
+
+file(REMOVE_RECURSE ${LIBEDIT_SPACE_FREE_BASE})
+file(MAKE_DIRECTORY ${LIBEDIT_COPY_DIR})
+file(COPY ${LIBEDIT_SRC_DIR}/ DESTINATION ${LIBEDIT_COPY_DIR})
 
 # Find the ncurses include directory (may be in a subdirectory like ncurses/)
 find_path(NCURSES_INCLUDE_DIR ncurses.h PATH_SUFFIXES ncurses)
@@ -149,15 +162,15 @@ if(APPLE AND CMAKE_OSX_SYSROOT)
 endif()
 
 ExternalProject_Add(libedit_vendored
-    SOURCE_DIR ${LIBEDIT_SRC_DIR}
+    SOURCE_DIR ${LIBEDIT_COPY_DIR}
     # Touch autotools-generated files so make does not try to regenerate
     # them (aclocal-1.16 etc. are not available on CI).
     PATCH_COMMAND
-        find ${LIBEDIT_SRC_DIR} -name aclocal.m4 -exec touch {} + &&
-        find ${LIBEDIT_SRC_DIR} -name configure -exec touch {} + &&
-        find ${LIBEDIT_SRC_DIR} -name config.h.in -exec touch {} + &&
-        find ${LIBEDIT_SRC_DIR} -name Makefile.in -exec touch {} +
-    CONFIGURE_COMMAND ${LIBEDIT_SRC_DIR}/configure
+        find ${LIBEDIT_COPY_DIR} -name aclocal.m4 -exec touch {} + &&
+        find ${LIBEDIT_COPY_DIR} -name configure -exec touch {} + &&
+        find ${LIBEDIT_COPY_DIR} -name config.h.in -exec touch {} + &&
+        find ${LIBEDIT_COPY_DIR} -name Makefile.in -exec touch {} +
+    CONFIGURE_COMMAND ${LIBEDIT_COPY_DIR}/configure
         --prefix=${LIBEDIT_INSTALL_DIR}
         --enable-static --disable-shared
         ${LIBEDIT_HOST_FLAG}
