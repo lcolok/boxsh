@@ -1,4 +1,5 @@
 #include "rpc.h"
+#include "terminal.h"
 #include "worker_pool.h"
 
 #include <cerrno>
@@ -134,6 +135,48 @@ bool rpc_parse_request(const std::string &line, RpcRequest &req,
             }
             return true;
         }
+        // Terminal tools
+        if (tool_name == "run_in_terminal") {
+            req.tool = ToolKind::TerminalRun;
+            if (!args.contains("command") || !args["command"].is_string()) {
+                parse_error = "run_in_terminal missing string field: command";
+                return false;
+            }
+            req.terminal_command = args["command"].get<std::string>();
+            if (args.contains("cols") && args["cols"].is_number())
+                req.terminal_cols = args["cols"].get<int>();
+            if (args.contains("rows") && args["rows"].is_number())
+                req.terminal_rows = args["rows"].get<int>();
+            return true;
+        }
+        if (tool_name == "send_to_terminal") {
+            req.tool = ToolKind::TerminalSend;
+            if (!args.contains("id") || !args["id"].is_string()) {
+                parse_error = "send_to_terminal missing string field: id";
+                return false;
+            }
+            req.session_id = args["id"].get<std::string>();
+            if (!args.contains("command") || !args["command"].is_string()) {
+                parse_error = "send_to_terminal missing string field: command";
+                return false;
+            }
+            req.terminal_command = args["command"].get<std::string>();
+            return true;
+        }
+        if (tool_name == "kill_terminal") {
+            req.tool = ToolKind::TerminalKill;
+            if (!args.contains("id") || !args["id"].is_string()) {
+                parse_error = "kill_terminal missing string field: id";
+                return false;
+            }
+            req.session_id = args["id"].get<std::string>();
+            return true;
+        }
+        if (tool_name == "list_terminals") {
+            req.tool = ToolKind::TerminalList;
+            return true;
+        }
+
         parse_error = "unknown tool: " + tool_name;
         return false;
     }
@@ -215,10 +258,6 @@ std::string rpc_serialize_response(const RpcResponse &resp) {
 
     return j.dump();
 }
-
-// ---------------------------------------------------------------------------
-// MCP protocol handlers
-// ---------------------------------------------------------------------------
 
 static std::string mcp_initialize_response(const json &id,
                                             const std::string &client_version) {
@@ -371,6 +410,85 @@ static std::string mcp_tools_list_response(const json &id) {
         }}
     });
 
+    // run_in_terminal tool
+    tools.push_back({
+        {"name", "run_in_terminal"},
+        {"description",
+         "Start a persistent PTY session running the given command (e.g. \"bash\"). "
+         "Returns a session id and initial screen output. "
+         "Use send_to_terminal to send further input, kill_terminal to close."},
+        {"inputSchema", {
+            {"type", "object"},
+            {"properties", {
+                {"command",     {{"type", "string"}, {"description", "Command to run in the PTY (e.g. bash)"}}},
+                {"explanation", {{"type", "string"}, {"description", "Why this terminal is needed"}}},
+                {"goal",        {{"type", "string"}, {"description", "What you intend to accomplish"}}}
+            }},
+            {"required", json::array({"command"})}
+        }},
+        {"annotations", {
+            {"title", "Run in Terminal"},
+            {"readOnlyHint", false},
+            {"destructiveHint", false}
+        }}
+    });
+
+    // send_to_terminal tool
+    tools.push_back({
+        {"name", "send_to_terminal"},
+        {"description",
+         "Send a command or text to an existing terminal session's stdin. "
+         "Append \\n to execute as a shell command."},
+        {"inputSchema", {
+            {"type", "object"},
+            {"properties", {
+                {"id",      {{"type", "string"}, {"description", "Terminal session id"}}},
+                {"command", {{"type", "string"}, {"description", "Text to write to the PTY stdin"}}}
+            }},
+            {"required", json::array({"id", "command"})}
+        }},
+        {"annotations", {
+            {"title", "Send to Terminal"},
+            {"readOnlyHint", false},
+            {"destructiveHint", false}
+        }}
+    });
+
+    // kill_terminal tool
+    tools.push_back({
+        {"name", "kill_terminal"},
+        {"description",
+         "Kill a terminal session and free its resources. Returns the final screen snapshot."},
+        {"inputSchema", {
+            {"type", "object"},
+            {"properties", {
+                {"id", {{"type", "string"}, {"description", "Terminal session id"}}}
+            }},
+            {"required", json::array({"id"})}
+        }},
+        {"annotations", {
+            {"title", "Kill Terminal"},
+            {"readOnlyHint", false},
+            {"destructiveHint", true}
+        }}
+    });
+
+    // list_terminals tool
+    tools.push_back({
+        {"name", "list_terminals"},
+        {"description", "List all active terminal sessions."},
+        {"inputSchema", {
+            {"type", "object"},
+            {"properties", json::object()},
+            {"required", json::array()}
+        }},
+        {"annotations", {
+            {"title", "List Terminals"},
+            {"readOnlyHint", true},
+            {"destructiveHint", false}
+        }}
+    });
+
     json j;
     j["jsonrpc"] = "2.0";
     j["id"] = id;
@@ -379,7 +497,76 @@ static std::string mcp_tools_list_response(const json &id) {
 }
 
 // ---------------------------------------------------------------------------
-// Built-in tool handlers
+// Terminal tool handlers
+// ---------------------------------------------------------------------------
+
+static std::string tool_terminal_run(const RpcRequest &req) {
+    auto result = terminal_create(req.terminal_command,
+                                  req.terminal_cols, req.terminal_rows);
+    json j;
+    j["jsonrpc"] = "2.0";
+    j["id"] = req.id;
+    json r;
+    r["content"] = json::array({{{"type", "text"}, {"text", result.output}}});
+    r["structuredContent"] = {{"id", result.id}, {"output", result.output}};
+    j["result"] = r;
+    return j.dump();
+}
+
+static std::string tool_terminal_send(const RpcRequest &req) {
+    json j;
+    j["jsonrpc"] = "2.0";
+    j["id"] = req.id;
+    json r;
+    try {
+        terminal_send(req.session_id, req.terminal_command);
+        r["content"] = json::array({{{"type", "text"}, {"text", "ok"}}});
+        r["structuredContent"] = {{"ok", true}};
+    } catch (const std::exception &e) {
+        r["content"] = json::array({{{"type", "text"}, {"text", e.what()}}});
+        r["isError"] = true;
+    }
+    j["result"] = r;
+    return j.dump();
+}
+
+static std::string tool_terminal_kill(const RpcRequest &req) {
+    json j;
+    j["jsonrpc"] = "2.0";
+    j["id"] = req.id;
+    json r;
+    try {
+        std::string snap = terminal_kill(req.session_id);
+        r["content"] = json::array({{{"type", "text"}, {"text", snap}}});
+        r["structuredContent"] = {{"output", snap}};
+    } catch (const std::exception &e) {
+        r["content"] = json::array({{{"type", "text"}, {"text", e.what()}}});
+        r["isError"] = true;
+    }
+    j["result"] = r;
+    return j.dump();
+}
+
+static std::string tool_terminal_list(const RpcRequest &req) {
+    auto sessions = terminal_list();
+    json arr = json::array();
+    for (auto &s : sessions) {
+        arr.push_back({{"id", s.id}, {"command", s.command},
+                       {"alive", s.alive}, {"cols", s.cols}, {"rows", s.rows}});
+    }
+    std::string text = arr.dump();
+    json j;
+    j["jsonrpc"] = "2.0";
+    j["id"] = req.id;
+    json r;
+    r["content"] = json::array({{{"type", "text"}, {"text", text}}});
+    r["structuredContent"] = {{"sessions", arr}};
+    j["result"] = r;
+    return j.dump();
+}
+
+// ---------------------------------------------------------------------------
+// RPC run loop
 // ---------------------------------------------------------------------------
 
 static RpcResponse tool_read(const RpcRequest &req) {
@@ -765,6 +952,16 @@ void rpc_run_loop(int fd_in, int fd_out, WorkerPool &pool) {
                 case ToolKind::Edit:  resp = tool_edit(req);  break;
                 default: break;
             }
+            // Terminal tools produce pre-serialized JSON strings.
+            std::string terminal_payload;
+            switch (req.tool) {
+                case ToolKind::TerminalRun:  terminal_payload = tool_terminal_run(req);  break;
+                case ToolKind::TerminalSend: terminal_payload = tool_terminal_send(req); break;
+                case ToolKind::TerminalKill: terminal_payload = tool_terminal_kill(req); break;
+                case ToolKind::TerminalList: terminal_payload = tool_terminal_list(req); break;
+                default: break;
+            }
+            if (!terminal_payload.empty()) { write_msg(terminal_payload); return; }
             write_resp(resp);
             return;
         }
@@ -773,14 +970,26 @@ void rpc_run_loop(int fd_in, int fd_out, WorkerPool &pool) {
 
         int write_fd = sv[1];
         std::thread([req, write_fd]() {
-            RpcResponse resp;
+            // Terminal tools produce pre-serialized JSON.
+            std::string terminal_payload;
             switch (req.tool) {
-                case ToolKind::Read:  resp = tool_read(req);  break;
-                case ToolKind::Write: resp = tool_write(req); break;
-                case ToolKind::Edit:  resp = tool_edit(req);  break;
+                case ToolKind::TerminalRun:  terminal_payload = tool_terminal_run(req);  break;
+                case ToolKind::TerminalSend: terminal_payload = tool_terminal_send(req); break;
+                case ToolKind::TerminalKill: terminal_payload = tool_terminal_kill(req); break;
+                case ToolKind::TerminalList: terminal_payload = tool_terminal_list(req); break;
                 default: break;
             }
-            std::string payload = rpc_serialize_response(resp) + '\n';
+            RpcResponse resp;
+            if (terminal_payload.empty()) {
+                switch (req.tool) {
+                    case ToolKind::Read:  resp = tool_read(req);  break;
+                    case ToolKind::Write: resp = tool_write(req); break;
+                    case ToolKind::Edit:  resp = tool_edit(req);  break;
+                    default: break;
+                }
+                terminal_payload = rpc_serialize_response(resp);
+            }
+            std::string payload = terminal_payload + '\n';
             uint32_t len = (uint32_t)payload.size();
             (void)write(write_fd, &len, 4);
             (void)write(write_fd, payload.c_str(), len);

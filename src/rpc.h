@@ -13,7 +13,8 @@ namespace boxsh {
 // Built-in tool types
 // ---------------------------------------------------------------------------
 
-enum class ToolKind { None, Read, Write, Edit };
+enum class ToolKind { None, Read, Write, Edit,
+    TerminalRun, TerminalSend, TerminalKill, TerminalList };
 
 struct EditOp {
     std::string old_text;
@@ -46,6 +47,12 @@ struct RpcRequest {
 
     // tool = "edit"
     std::vector<EditOp> edits;
+
+    // tool = terminal_*
+    std::string session_id;
+    std::string terminal_command;
+    int         terminal_cols = 220;
+    int         terminal_rows = 50;
 };
 
 // ---------------------------------------------------------------------------

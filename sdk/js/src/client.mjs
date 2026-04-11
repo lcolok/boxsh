@@ -219,6 +219,83 @@ export class BoxshClient {
         };
     }
 
+    // -----------------------------------------------------------------
+    // Terminal tools
+    // -----------------------------------------------------------------
+
+    /**
+     * Start a persistent PTY session.
+     *
+     * @param {string} command   Command to run (e.g. "bash")
+     * @param {object} [opts]
+     * @param {string} [opts.explanation]  Why this terminal is needed
+     * @param {string} [opts.goal]         What you intend to accomplish
+     * @param {number} [opts.cols]         Terminal columns (default: 220)
+     * @param {number} [opts.rows]         Terminal rows (default: 50)
+     * @returns {Promise<{ id: string, output: string }>}
+     */
+    async runInTerminal(command, opts = {}) {
+        const args = { command };
+        if (opts.explanation) args.explanation = opts.explanation;
+        if (opts.goal)        args.goal        = opts.goal;
+        if (opts.cols)        args.cols         = opts.cols;
+        if (opts.rows)        args.rows         = opts.rows;
+
+        const result = await this.#send({
+            method: 'tools/call',
+            params: { name: 'run_in_terminal', arguments: args },
+        });
+        this.#checkToolError(result);
+        const sc = result.structuredContent ?? {};
+        return { id: sc.id ?? '', output: sc.output ?? '' };
+    }
+
+    /**
+     * Send text to a terminal session's PTY stdin.
+     *
+     * @param {string} id        Session id
+     * @param {string} command   Text to write (append \n for execution)
+     * @returns {Promise<void>}
+     */
+    async sendToTerminal(id, command) {
+        const result = await this.#send({
+            method: 'tools/call',
+            params: { name: 'send_to_terminal', arguments: { id, command } },
+        });
+        this.#checkToolError(result);
+    }
+
+    /**
+     * Kill a terminal session and free its resources.
+     *
+     * @param {string} id   Session id
+     * @returns {Promise<string>}  Final screen snapshot
+     */
+    async killTerminal(id) {
+        const result = await this.#send({
+            method: 'tools/call',
+            params: { name: 'kill_terminal', arguments: { id } },
+        });
+        this.#checkToolError(result);
+        const sc = result.structuredContent ?? {};
+        return sc.output ?? '';
+    }
+
+    /**
+     * List all terminal sessions.
+     *
+     * @returns {Promise<Array<{ id: string, command: string, alive: boolean, cols: number, rows: number }>>}
+     */
+    async listTerminals() {
+        const result = await this.#send({
+            method: 'tools/call',
+            params: { name: 'list_terminals', arguments: {} },
+        });
+        this.#checkToolError(result);
+        const sc = result.structuredContent ?? {};
+        return sc.sessions ?? [];
+    }
+
     /**
      * Close stdin and wait for the boxsh process to exit.
      * @returns {Promise<void>}

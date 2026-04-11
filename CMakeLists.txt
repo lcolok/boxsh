@@ -172,12 +172,38 @@ ExternalProject_Add(libedit_vendored
 )
 
 # ---------------------------------------------------------------------------
+# libvterm (vendored, pure-C VT220/xterm emulator used by Neovim)
+# ---------------------------------------------------------------------------
+set(LIBVTERM_SRC_DIR ${CMAKE_CURRENT_SOURCE_DIR}/third_party/libvterm/src)
+
+add_library(libvterm_static STATIC
+    ${LIBVTERM_SRC_DIR}/vterm.c
+    ${LIBVTERM_SRC_DIR}/parser.c
+    ${LIBVTERM_SRC_DIR}/unicode.c
+    ${LIBVTERM_SRC_DIR}/screen.c
+    ${LIBVTERM_SRC_DIR}/state.c
+    ${LIBVTERM_SRC_DIR}/pen.c
+    ${LIBVTERM_SRC_DIR}/encoding.c
+    ${LIBVTERM_SRC_DIR}/keyboard.c
+    ${LIBVTERM_SRC_DIR}/mouse.c
+)
+
+target_include_directories(libvterm_static
+    PUBLIC
+        ${CMAKE_CURRENT_SOURCE_DIR}/third_party/libvterm/src
+        ${CMAKE_CURRENT_SOURCE_DIR}/third_party/libvterm/include
+)
+
+target_compile_options(libvterm_static PRIVATE -w)
+
+# ---------------------------------------------------------------------------
 # boxsh executable
 # ---------------------------------------------------------------------------
 
 add_executable(boxsh
     src/main.cpp
     src/rpc.cpp
+    src/terminal.cpp
     src/worker_pool.cpp
 )
 
@@ -194,6 +220,7 @@ target_include_directories(boxsh
         ${DASH_SRC_DIR}
         ${DASH_ROOT}
         ${CMAKE_CURRENT_SOURCE_DIR}/third_party
+        ${CMAKE_CURRENT_SOURCE_DIR}/third_party/libvterm/include
         ${LIBEDIT_INSTALL_DIR}/include
 )
 
@@ -214,6 +241,7 @@ target_link_libraries(boxsh
     PRIVATE
         dash_static
         nlohmann_json
+        libvterm_static
         ${LIBEDIT_INSTALL_DIR}/lib/libedit.a
         ncurses
         pthread

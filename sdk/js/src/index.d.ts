@@ -27,6 +27,26 @@ export interface EditResult {
     firstChangedLine: number;
 }
 
+export interface TerminalSession {
+    id: string;
+    command: string;
+    alive: boolean;
+    cols: number;
+    rows: number;
+}
+
+export interface RunInTerminalOptions {
+    explanation?: string;
+    goal?: string;
+    cols?: number;
+    rows?: number;
+}
+
+export interface RunInTerminalResult {
+    id: string;
+    output: string;
+}
+
 export interface Change {
     path: string;
     type: 'added' | 'modified' | 'deleted';
@@ -38,6 +58,10 @@ export class BoxshClient {
     read(filePath: string, offset?: number, limit?: number): Promise<string>;
     write(filePath: string, content: string): Promise<void>;
     edit(filePath: string, edits: EditOperation[]): Promise<EditResult>;
+    runInTerminal(command: string, opts?: RunInTerminalOptions): Promise<RunInTerminalResult>;
+    sendToTerminal(id: string, command: string): Promise<void>;
+    killTerminal(id: string): Promise<string>;
+    listTerminals(): Promise<TerminalSession[]>;
     close(): Promise<void>;
     terminate(): void;
 }

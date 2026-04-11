@@ -105,15 +105,18 @@ describe('mcp — tools/list', () => {
     assert.ok(Array.isArray(resp.result.tools), 'expected tools array');
   });
 
-  test('contains exactly 4 tools', () => {
+  test('contains exactly 8 tools', () => {
     const resp = mcpOne({ jsonrpc: '2.0', id: 'tl-2', method: 'tools/list' });
-    assert.equal(resp.result.tools.length, 4);
+    assert.equal(resp.result.tools.length, 8);
   });
 
-  test('tool names are bash, read, write, edit', () => {
+  test('tool names include bash, read, write, edit and terminal tools', () => {
     const resp = mcpOne({ jsonrpc: '2.0', id: 'tl-3', method: 'tools/list' });
     const names = resp.result.tools.map(t => t.name).sort();
-    assert.deepEqual(names, ['bash', 'edit', 'read', 'write']);
+    assert.deepEqual(names, [
+      'bash', 'edit', 'kill_terminal', 'list_terminals',
+      'read', 'run_in_terminal', 'send_to_terminal', 'write',
+    ]);
   });
 
   test('each tool has name, description, and inputSchema', () => {
@@ -381,7 +384,7 @@ describe('mcp — full handshake', () => {
 
     // tools/list
     assert.equal(resps[1].id, 'h-2');
-    assert.equal(resps[1].result.tools.length, 4);
+    assert.equal(resps[1].result.tools.length, 8);
 
     // tools/call
     assert.equal(resps[2].id, 'h-3');
