@@ -249,6 +249,10 @@ target_link_libraries(boxsh
         pthread
 )
 
+if(APPLE)
+    target_link_libraries(boxsh PRIVATE "-framework CoreFoundation")
+endif()
+
 add_dependencies(boxsh libedit_vendored)
 
 

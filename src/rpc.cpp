@@ -7,6 +7,7 @@
 #include <cerrno>
 #include <climits>
 #include <cstring>
+#include <dirent.h>
 #include <fstream>
 #include <sstream>
 #include <string>
@@ -21,6 +22,10 @@
 #include <unistd.h>
 
 #include <nlohmann/json.hpp>
+
+#ifdef __APPLE__
+#include <CoreFoundation/CoreFoundation.h>
+#endif
 
 using json = nlohmann::json;
 
@@ -556,6 +561,93 @@ static std::string tool_terminal_list(const RpcRequest &req) {
 }
 
 // ---------------------------------------------------------------------------
+// macOS path normalization
+// ---------------------------------------------------------------------------
+
+// Normalize a file path for macOS compatibility.  macOS filenames may use
+// NFD (decomposed) Unicode, curly apostrophe (U+2019) in screenshot names,
+// and narrow no-break space (U+202F) in AM/PM timestamps.  When a path
+// does not exist as-is, we try the normalized variant before giving up.
+
+// Reduce a string to a canonical ASCII form for comparison purposes.
+// Both the on-disk name and the requested name are reduced, so the match
+// works regardless of which side has the Unicode variant.
+static std::string normalize_to_ascii(const std::string &s) {
+    std::string r = s;
+
+    // Curly single quotes → ASCII apostrophe (U+2018 = 0xE2 0x80 0x98,
+    // U+2019 = 0xE2 0x80 0x99).
+    for (size_t pos = 0; (pos = r.find("\xe2\x80\x98", pos)) != std::string::npos;)
+        r.replace(pos, 3, "'"), ++pos;
+    for (size_t pos = 0; (pos = r.find("\xe2\x80\x99", pos)) != std::string::npos;)
+        r.replace(pos, 3, "'"), ++pos;
+
+    // Narrow no-break space → regular space (U+202F = 0xE2 0x80 0xAF).
+    for (size_t pos = 0; (pos = r.find("\xe2\x80\xaf", pos)) != std::string::npos;)
+        r.replace(pos, 3, " "), ++pos;
+
+#ifdef __APPLE__
+    // NFD → NFC via CoreFoundation.
+    CFStringRef cf = CFStringCreateWithBytes(
+        kCFAllocatorDefault,
+        reinterpret_cast<const UInt8 *>(r.data()), (CFIndex)r.size(),
+        kCFStringEncodingUTF8, false);
+    if (cf) {
+        CFMutableStringRef mut = CFStringCreateMutableCopy(
+            kCFAllocatorDefault, 0, cf);
+        CFRelease(cf);
+        if (mut) {
+            CFStringNormalize(mut, kCFStringNormalizationFormC);
+            CFIndex len = CFStringGetMaximumSizeForEncoding(
+                CFStringGetLength(mut), kCFStringEncodingUTF8) + 1;
+            std::string nfc(len, '\0');
+            if (CFStringGetCString(mut, &nfc[0], len, kCFStringEncodingUTF8))
+                r = nfc.c_str();
+            CFRelease(mut);
+        }
+    }
+#endif
+    return r;
+}
+
+// Try stat() with the original path first; on ENOENT, scan the parent
+// directory for a filename that matches after Unicode normalization.
+static int stat_normalized(const std::string &path, struct stat *st,
+                           std::string &resolved) {
+    if (stat(path.c_str(), st) == 0) {
+        resolved = path;
+        return 0;
+    }
+    if (errno != ENOENT) return -1;
+
+    // Extract parent directory and base filename.
+    auto slash = path.rfind('/');
+    if (slash == std::string::npos) return -1;
+    std::string dir = path.substr(0, slash);
+    std::string base = path.substr(slash + 1);
+    if (base.empty()) return -1;
+
+    std::string norm_base = normalize_to_ascii(base);
+
+    DIR *dp = opendir(dir.c_str());
+    if (!dp) return -1;
+
+    struct dirent *ent;
+    while ((ent = readdir(dp)) != nullptr) {
+        if (normalize_to_ascii(ent->d_name) == norm_base) {
+            std::string candidate = dir + "/" + ent->d_name;
+            if (stat(candidate.c_str(), st) == 0) {
+                resolved = candidate;
+                closedir(dp);
+                return 0;
+            }
+        }
+    }
+    closedir(dp);
+    return -1;
+}
+
+// ---------------------------------------------------------------------------
 // RPC run loop
 // ---------------------------------------------------------------------------
 
@@ -565,9 +657,10 @@ static std::string tool_read_json(const RpcRequest &req) {
     j["id"] = req.id;
     json r;
 
-    // Check file existence first.
+    // Check file existence first, with macOS path normalization fallback.
     struct stat st;
-    if (stat(req.path.c_str(), &st) != 0) {
+    std::string resolved_path;
+    if (stat_normalized(req.path, &st, resolved_path) != 0) {
         r["content"] = json::array({{{"type", "text"},
             {"text", std::string("read: cannot open file: ") + req.path +
                      ": " + strerror(errno)}}});
@@ -577,14 +670,14 @@ static std::string tool_read_json(const RpcRequest &req) {
     }
 
     // Detect binary via magic bytes.
-    auto ft = detect_file_type(req.path);
+    auto ft = detect_file_type(resolved_path);
 
     if (ft.binary) {
         bool is_image = (ft.mime.rfind("image/", 0) == 0);
 
         if (is_image) {
             // Image: read, resize if needed, return as MCP image content.
-            std::ifstream f(req.path, std::ios::binary);
+            std::ifstream f(resolved_path, std::ios::binary);
             if (!f) {
                 r["content"] = json::array({{{"type", "text"},
                     {"text", std::string("read: cannot open file: ") + req.path +
@@ -642,7 +735,7 @@ static std::string tool_read_json(const RpcRequest &req) {
         static constexpr int    DEFAULT_MAX_LINES = 2000;
         static constexpr size_t DEFAULT_MAX_BYTES = 50 * 1024;  // 50KB
 
-        std::ifstream f(req.path);
+        std::ifstream f(resolved_path);
         if (!f) {
             r["content"] = json::array({{{"type", "text"},
                 {"text", std::string("read: cannot open file: ") + req.path +
@@ -810,8 +903,17 @@ static RpcResponse tool_edit(const RpcRequest &req) {
     resp.id   = req.id;
     resp.tool = ToolKind::Edit;
 
+    // Resolve path with macOS normalization fallback.
+    std::string resolved_path = req.path;
+    {
+        struct stat st;
+        std::string rp;
+        if (stat_normalized(req.path, &st, rp) == 0)
+            resolved_path = rp;
+    }
+
     // Read existing content.
-    std::ifstream fin(req.path, std::ios::binary);
+    std::ifstream fin(resolved_path, std::ios::binary);
     if (!fin) {
         resp.error = std::string("edit: cannot open file: ") + req.path +
                      ": " + strerror(errno);
@@ -996,7 +1098,7 @@ static RpcResponse tool_edit(const RpcRequest &req) {
         content.insert(0, utf8_bom);
 
     // Write result.
-    std::ofstream fout(req.path, std::ios::binary | std::ios::trunc);
+    std::ofstream fout(resolved_path, std::ios::binary | std::ios::trunc);
     if (!fout) {
         resp.error = std::string("edit: cannot write file: ") + req.path +
                      ": " + strerror(errno);
@@ -1005,7 +1107,7 @@ static RpcResponse tool_edit(const RpcRequest &req) {
     fout << content;
     fout.close();
 
-    resp.diff = make_diff(req.path, original, content, resp.first_changed_line);
+    resp.diff = make_diff(resolved_path, original, content, resp.first_changed_line);
     return resp;
 }
 

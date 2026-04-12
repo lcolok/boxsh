@@ -602,3 +602,71 @@ describe('tool — sandbox isolation', () => {
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// macOS NFD / Unicode path normalization
+// ---------------------------------------------------------------------------
+
+describe('tool — Unicode path normalization', () => {
+  test('read handles curly apostrophe (U+2019) in filename', () => {
+    // macOS screenshot filenames use \u2019 (curly right single quote)
+    // e.g. "User\u2019s Screenshot.png" — LLMs often send ASCII apostrophe.
+    const dir = path.join(os.tmpdir(), `boxsh-unicode-${process.pid}-${Math.random().toString(36).slice(2)}`);
+    fs.mkdirSync(dir, { recursive: true });
+    const realName = path.join(dir, 'it\u2019s a test.txt');
+    fs.writeFileSync(realName, 'curly\n', 'utf8');
+    try {
+      // Request with ASCII apostrophe — should still find the file.
+      const asciiPath = path.join(dir, "it's a test.txt");
+      const resp = rpc({ id: '1', tool: 'read', path: asciiPath });
+      assert.ok(!resp.error, `unexpected error: ${resp.error}`);
+      assert.equal(resp.content, 'curly\n');
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('read handles narrow no-break space (U+202F) in filename', () => {
+    // macOS uses U+202F before AM/PM in timestamps (e.g. "3\u202FPM").
+    const dir = path.join(os.tmpdir(), `boxsh-unicode-${process.pid}-${Math.random().toString(36).slice(2)}`);
+    fs.mkdirSync(dir, { recursive: true });
+    const realName = path.join(dir, 'shot 3\u202FPM.txt');
+    fs.writeFileSync(realName, 'narrow nbsp\n', 'utf8');
+    try {
+      // Request with regular space — should still find the file.
+      const spacePath = path.join(dir, 'shot 3 PM.txt');
+      const resp = rpc({ id: '1', tool: 'read', path: spacePath });
+      assert.ok(!resp.error, `unexpected error: ${resp.error}`);
+      assert.equal(resp.content, 'narrow nbsp\n');
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('edit handles curly apostrophe (U+2019) in filename', () => {
+    const dir = path.join(os.tmpdir(), `boxsh-unicode-${process.pid}-${Math.random().toString(36).slice(2)}`);
+    fs.mkdirSync(dir, { recursive: true });
+    const realName = path.join(dir, 'it\u2019s a file.txt');
+    fs.writeFileSync(realName, 'old content\n', 'utf8');
+    try {
+      const asciiPath = path.join(dir, "it's a file.txt");
+      const resp = rpc({
+        id: '1', tool: 'edit', path: asciiPath,
+        edits: [{ oldText: 'old content', newText: 'new content' }],
+      });
+      assert.ok(!resp.error, `unexpected error: ${resp.error}`);
+      assert.equal(fs.readFileSync(realName, 'utf8'), 'new content\n');
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('exact path still works without normalization', () => {
+    const p = tmpFile('hello\n');
+    try {
+      const resp = rpc({ id: '1', tool: 'read', path: p });
+      assert.ok(!resp.error, `unexpected error: ${resp.error}`);
+      assert.equal(resp.content, 'hello\n');
+    } finally { fs.rmSync(p, { force: true }); }
+  });
+});
