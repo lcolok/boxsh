@@ -266,14 +266,12 @@ describe('tool — write', () => {
     } finally { fs.rmSync(p, { force: true }); }
   });
 
-  test('writing to an existing file returns error', () => {
+  test('writing to an existing file overwrites it', () => {
     const p = tmpFile('old content\n');
     try {
       const resp = rpc({ id: '1', tool: 'write', path: p, content: 'new content\n' });
-      assert.ok(resp.error, 'expected error for existing file');
-      assert.match(resp.error, /already exists/);
-      // File must be unchanged.
-      assert.equal(fs.readFileSync(p, 'utf8'), 'old content\n');
+      assert.ok(!resp.error, `unexpected error: ${resp.error}`);
+      assert.equal(fs.readFileSync(p, 'utf8'), 'new content\n');
     } finally { fs.rmSync(p, { force: true }); }
   });
 
@@ -303,16 +301,15 @@ describe('tool — write', () => {
     } finally { fs.rmSync(base, { recursive: true, force: true }); }
   });
 
-  test('write auto-create dirs still rejects existing file', () => {
+  test('write overwrites existing file in nested dir', () => {
     const base = path.join(os.tmpdir(), `boxsh-mkdir2-${process.pid}-${Math.random().toString(36).slice(2)}`);
     const p = path.join(base, 'file.txt');
     try {
       fs.mkdirSync(base, { recursive: true });
       fs.writeFileSync(p, 'old\n');
       const resp = rpc({ id: '1', tool: 'write', path: p, content: 'new\n' });
-      assert.ok(resp.error, 'expected error for existing file');
-      assert.match(resp.error, /already exists/);
-      assert.equal(fs.readFileSync(p, 'utf8'), 'old\n');
+      assert.ok(!resp.error, `unexpected error: ${resp.error}`);
+      assert.equal(fs.readFileSync(p, 'utf8'), 'new\n');
     } finally { fs.rmSync(base, { recursive: true, force: true }); }
   });
 });
@@ -511,12 +508,13 @@ describe('tool — isError consistency', () => {
     assert.ok(resp.error, 'expected error text');
   });
 
-  test('write existing file sets isError in raw response', () => {
+  test('write overwrite does not set isError', () => {
     const p = tmpFile('existing\n');
     try {
       const resp = rpc({ id: '1', tool: 'write', path: p, content: 'overwrite\n' });
-      assert.ok(resp.isError === true, 'expected isError to be true');
-      assert.ok(resp.error, 'expected error text');
+      assert.ok(!resp.isError, 'isError should not be set on overwrite');
+      assert.ok(!resp.error, 'no error expected on overwrite');
+      assert.equal(fs.readFileSync(p, 'utf8'), 'overwrite\n');
     } finally { fs.rmSync(p, { force: true }); }
   });
 

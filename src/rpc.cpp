@@ -345,8 +345,8 @@ static std::string mcp_tools_list_response(const json &id) {
     tools.push_back({
         {"name", "write"},
         {"description",
-         "Create a new file with the given content. "
-         "Fails if the file already exists — use the edit tool to modify existing files."},
+         "Create or overwrite a file with the given content. "
+         "Parent directories are created automatically if needed."},
         {"inputSchema", {
             {"type", "object"},
             {"properties", {
@@ -812,47 +812,35 @@ static RpcResponse tool_write(const RpcRequest &req) {
     resp.id   = req.id;
     resp.tool = ToolKind::Write;
 
-    // O_CREAT | O_EXCL: atomic create-only — fails if the file already exists.
-    int fd = open(req.path.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0644);
-    if (fd < 0 && errno == ENOENT) {
+    std::ofstream f(req.path, std::ios::binary | std::ios::trunc);
+    if (!f && errno == ENOENT) {
         // Auto-create parent directories (mkdir -p).
         std::string dir = req.path;
         auto slash = dir.rfind('/');
         if (slash != std::string::npos && slash > 0) {
             dir.resize(slash);
-            // Iteratively create directories from root to leaf.
             for (size_t i = 1; i <= dir.size(); ++i) {
                 if (i == dir.size() || dir[i] == '/') {
                     std::string part = dir.substr(0, i);
-                    mkdir(part.c_str(), 0755);  // ignore EEXIST
+                    mkdir(part.c_str(), 0755);
                 }
             }
-            fd = open(req.path.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0644);
+            f.open(req.path, std::ios::binary | std::ios::trunc);
         }
     }
-    if (fd < 0) {
-        if (errno == EEXIST)
-            resp.error = std::string("write: file already exists: ") + req.path;
-        else
-            resp.error = std::string("write: cannot create file: ") + req.path +
-                         ": " + strerror(errno);
+    if (!f) {
+        resp.error = std::string("write: cannot create file: ") + req.path +
+                     ": " + strerror(errno);
         return resp;
     }
 
-    const char *data = req.content.data();
-    size_t remaining = req.content.size();
-    while (remaining > 0) {
-        ssize_t n = ::write(fd, data, remaining);
-        if (n < 0) {
-            close(fd);
-            resp.error = std::string("write: failed writing to: ") + req.path +
-                         ": " + strerror(errno);
-            return resp;
-        }
-        data += n;
-        remaining -= (size_t)n;
+    f.write(req.content.data(), (std::streamsize)req.content.size());
+    if (!f) {
+        resp.error = std::string("write: failed writing to: ") + req.path +
+                     ": " + strerror(errno);
+        return resp;
     }
-    close(fd);
+    f.close();
     resp.tool_content = "written " + std::to_string(req.content.size()) + " bytes";
     return resp;
 }

@@ -84,19 +84,11 @@ describe('BoxshClient — tool error handling', () => {
         assert.equal(fs.readFileSync(p, 'utf8'), 'hello\n');
     });
 
-    it('write() throws on existing file', async () => {
+    it('write() overwrites existing file', async () => {
         const p = path.join(tmpDir, 'existing.txt');
         fs.writeFileSync(p, 'original\n');
-        await assert.rejects(
-            () => client.write(p, 'overwrite\n'),
-            (err) => {
-                assert.ok(err instanceof Error);
-                assert.match(err.message, /already exists/);
-                return true;
-            },
-        );
-        // File must be unchanged.
-        assert.equal(fs.readFileSync(p, 'utf8'), 'original\n');
+        await client.write(p, 'overwrite\n');
+        assert.equal(fs.readFileSync(p, 'utf8'), 'overwrite\n');
     });
 
     it('edit() throws on missing file', async () => {
