@@ -42,6 +42,42 @@ describe('BoxshClient — tool error handling', () => {
         );
     });
 
+    it('read() returns structured result for text file', async () => {
+        const p = path.join(tmpDir, 'read-text.txt');
+        fs.writeFileSync(p, 'line1\nline2\nline3\n');
+        const result = await client.read(p);
+        assert.equal(result.encoding, 'text');
+        assert.equal(result.content, 'line1\nline2\nline3\n');
+        assert.equal(result.line_count, 3);
+        assert.equal(typeof result.mime_type, 'string');
+    });
+
+    it('read() returns metadata for binary file', async () => {
+        const p = path.join(tmpDir, 'read-bin.dat');
+        const buf = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00]);
+        fs.writeFileSync(p, buf);
+        const result = await client.read(p);
+        // Truncated PNG — stb can't decode, falls back to metadata.
+        assert.equal(result.encoding, 'metadata');
+        assert.equal(result.size, 10);
+    });
+
+    it('read() supports offset and limit', async () => {
+        const p = path.join(tmpDir, 'read-offset.txt');
+        fs.writeFileSync(p, 'a\nb\nc\nd\ne\n');
+        const result = await client.read(p, 2, 2);
+        assert.equal(result.encoding, 'text');
+        assert.equal(result.content, 'b\nc\n');
+    });
+
+    it('read() returns empty file', async () => {
+        const p = path.join(tmpDir, 'read-empty.txt');
+        fs.writeFileSync(p, '');
+        const result = await client.read(p);
+        assert.equal(result.encoding, 'text');
+        assert.equal(result.content, '');
+    });
+
     it('write() creates a new file successfully', async () => {
         const p = path.join(tmpDir, 'new-file.txt');
         await client.write(p, 'hello\n');

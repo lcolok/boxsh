@@ -175,7 +175,11 @@ describe('mcp — tools/list', () => {
     const read = resp.result.tools.find(t => t.name === 'read');
     assert.ok(read.outputSchema, 'read should have outputSchema');
     assert.equal(read.outputSchema.type, 'object');
-    assert.ok('truncation' in read.outputSchema.properties);
+    assert.ok('content' in read.outputSchema.properties);
+    assert.ok('encoding' in read.outputSchema.properties);
+    assert.ok('mime_type' in read.outputSchema.properties);
+    assert.deepEqual(read.outputSchema.required.sort(),
+      ['content', 'encoding', 'mime_type']);
   });
 
   test('edit tool has outputSchema', () => {
@@ -262,7 +266,9 @@ describe('mcp — tools/call read', () => {
       });
       assert.ok(resp.result, 'expected result');
       assert.ok(Array.isArray(resp.result.content));
-      assert.equal(resp.result.content[0].text, 'MCP read test\n');
+      // content[0].text is now a JSON string; structuredContent.content has the file text.
+      assert.equal(resp.result.structuredContent.content, 'MCP read test\n');
+      assert.equal(resp.result.structuredContent.encoding, 'text');
     } finally { fs.rmSync(p, { force: true }); }
   });
 
@@ -273,7 +279,26 @@ describe('mcp — tools/call read', () => {
         jsonrpc: '2.0', id: 'tr-2', method: 'tools/call',
         params: { name: 'read', arguments: { path: p, offset: 2, limit: 2 } },
       });
-      assert.equal(resp.result.content[0].text, 'b\nc\n');
+      assert.equal(resp.result.structuredContent.content, 'b\nc\n');
+      assert.equal(resp.result.structuredContent.truncated, true);
+      assert.equal(resp.result.structuredContent.line_count, 2);
+    } finally { fs.rmSync(p, { force: true }); }
+  });
+
+  test('binary file returns metadata encoding', () => {
+    const p = path.join(os.tmpdir(),
+      `boxsh-mcp-bin-${process.pid}-${Math.random().toString(36).slice(2)}.bin`);
+    const buf = Buffer.from([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]);
+    fs.writeFileSync(p, buf);
+    try {
+      const resp = mcpOne({
+        jsonrpc: '2.0', id: 'tr-3', method: 'tools/call',
+        params: { name: 'read', arguments: { path: p } },
+      });
+      assert.ok(resp.result, 'expected result');
+      // Truncated PNG (8 bytes) — image can't be decoded, falls back to metadata.
+      assert.equal(resp.result.structuredContent.encoding, 'metadata');
+      assert.equal(resp.result.structuredContent.size, 8);
     } finally { fs.rmSync(p, { force: true }); }
   });
 });

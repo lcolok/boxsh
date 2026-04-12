@@ -1,4 +1,6 @@
 #include "rpc.h"
+#include "file_type.h"
+#include "image_resize.h"
 #include "terminal.h"
 #include "worker_pool.h"
 
@@ -13,6 +15,7 @@
 #include <fcntl.h>
 #include <poll.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <thread>
 #include <unistd.h>
@@ -204,38 +207,19 @@ std::string rpc_serialize_response(const RpcResponse &resp) {
 
         if (resp.tool == ToolKind::None) {
             // Bash command result.
-            std::string text;
             if (is_error) {
-                text = resp.error;
+                result["content"] = json::array({{{"type", "text"}, {"text", resp.error}}});
             } else {
-                text = resp.stdout_data;
-                if (!resp.stderr_data.empty()) {
-                    if (!text.empty()) text += "\n";
-                    text += resp.stderr_data;
-                }
-                if (text.empty())
-                    text = "(exit code " + std::to_string(resp.exit_code) + ")";
-            }
-            result["content"] = json::array({{{"type", "text"}, {"text", text}}});
-            if (!is_error) {
-                result["structuredContent"] = {
+                json sc = {
                     {"exit_code",   resp.exit_code},
                     {"stdout",      resp.stdout_data},
                     {"stderr",      resp.stderr_data},
                     {"duration_ms", resp.duration_ms}
                 };
+                result["content"] = json::array({{{"type", "text"}, {"text", sc.dump()}}});
+                result["structuredContent"] = sc;
                 if (resp.exit_code != 0)
                     is_error = true;
-            }
-        } else if (resp.tool == ToolKind::Read) {
-            std::string text = is_error ? resp.error : resp.tool_content;
-            result["content"] = json::array({{{"type", "text"}, {"text", text}}});
-            if (!is_error) {
-                int lines = 0;
-                for (char c : resp.tool_content) if (c == '\n') lines++;
-                result["structuredContent"] = {
-                    {"truncation", {{"truncated", false}, {"line_count", lines}}}
-                };
             }
         } else if (resp.tool == ToolKind::Write) {
             std::string text = is_error ? resp.error : resp.tool_content;
@@ -318,29 +302,28 @@ static std::string mcp_tools_list_response(const json &id) {
     tools.push_back({
         {"name", "read"},
         {"description",
-         "Read the contents of a file. Use offset/limit for large files."},
+         "Read the contents of a file. Binary files are returned as base64. "
+         "Use offset/limit for large text files."},
         {"inputSchema", {
             {"type", "object"},
             {"properties", {
                 {"path", {{"type", "string"}, {"description", "Path to the file to read (relative or absolute)"}}},
-                {"offset", {{"type", "number"}, {"description", "Line number to start reading from (1-indexed)"}}},
-                {"limit", {{"type", "number"}, {"description", "Maximum number of lines to read"}}}
+                {"offset", {{"type", "number"}, {"description", "Line number to start reading from (1-indexed, text files only)"}}},
+                {"limit", {{"type", "number"}, {"description", "Maximum number of lines to read (text files only)"}}}
             }},
             {"required", json::array({"path"})}
         }},
         {"outputSchema", {
             {"type", "object"},
             {"properties", {
-                {"truncation", {
-                    {"type", "object"},
-                    {"properties", {
-                        {"truncated", {{"type", "boolean"}, {"description", "Whether the output was truncated"}}},
-                        {"line_count", {{"type", "integer"}, {"description", "Number of lines returned"}}}
-                    }},
-                    {"required", json::array({"truncated", "line_count"})}
-                }}
+                {"content",   {{"type", "string"}, {"description", "File content (text or base64-encoded binary)"}}},
+                {"encoding",  {{"type", "string"}, {"description", "\"text\" or \"base64\""}}},
+                {"mime_type", {{"type", "string"}, {"description", "Detected MIME type"}}},
+                {"line_count", {{"type", "integer"}, {"description", "Number of lines returned (text only)"}}},
+                {"truncated", {{"type", "boolean"}, {"description", "Whether the output was truncated (text only)"}}},
+                {"size",      {{"type", "integer"}, {"description", "File size in bytes (binary only)"}}}
             }},
-            {"required", json::array({"truncation"})}
+            {"required", json::array({"content", "encoding", "mime_type"})}
         }},
         {"annotations", {
             {"title", "Read File"},
@@ -507,8 +490,9 @@ static std::string tool_terminal_run(const RpcRequest &req) {
     j["jsonrpc"] = "2.0";
     j["id"] = req.id;
     json r;
-    r["content"] = json::array({{{"type", "text"}, {"text", result.output}}});
-    r["structuredContent"] = {{"id", result.id}, {"output", result.output}};
+    json sc = {{"id", result.id}, {"output", result.output}};
+    r["content"] = json::array({{{"type", "text"}, {"text", sc.dump()}}});
+    r["structuredContent"] = sc;
     j["result"] = r;
     return j.dump();
 }
@@ -520,8 +504,9 @@ static std::string tool_terminal_send(const RpcRequest &req) {
     json r;
     try {
         terminal_send(req.session_id, req.terminal_command);
-        r["content"] = json::array({{{"type", "text"}, {"text", "ok"}}});
-        r["structuredContent"] = {{"ok", true}};
+        json sc = {{"ok", true}};
+        r["content"] = json::array({{{"type", "text"}, {"text", sc.dump()}}});
+        r["structuredContent"] = sc;
     } catch (const std::exception &e) {
         r["content"] = json::array({{{"type", "text"}, {"text", e.what()}}});
         r["isError"] = true;
@@ -537,8 +522,9 @@ static std::string tool_terminal_kill(const RpcRequest &req) {
     json r;
     try {
         std::string snap = terminal_kill(req.session_id);
-        r["content"] = json::array({{{"type", "text"}, {"text", snap}}});
-        r["structuredContent"] = {{"output", snap}};
+        json sc = {{"output", snap}};
+        r["content"] = json::array({{{"type", "text"}, {"text", sc.dump()}}});
+        r["structuredContent"] = sc;
     } catch (const std::exception &e) {
         r["content"] = json::array({{{"type", "text"}, {"text", e.what()}}});
         r["isError"] = true;
@@ -569,44 +555,136 @@ static std::string tool_terminal_list(const RpcRequest &req) {
 // RPC run loop
 // ---------------------------------------------------------------------------
 
-static RpcResponse tool_read(const RpcRequest &req) {
-    RpcResponse resp;
-    resp.id   = req.id;
-    resp.tool = ToolKind::Read;
+static std::string tool_read_json(const RpcRequest &req) {
+    json j;
+    j["jsonrpc"] = "2.0";
+    j["id"] = req.id;
+    json r;
 
-    std::ifstream f(req.path);
-    if (!f) {
-        resp.error = std::string("read: cannot open file: ") + req.path +
-                     ": " + strerror(errno);
-        return resp;
+    // Check file existence first.
+    struct stat st;
+    if (stat(req.path.c_str(), &st) != 0) {
+        r["content"] = json::array({{{"type", "text"},
+            {"text", std::string("read: cannot open file: ") + req.path +
+                     ": " + strerror(errno)}}});
+        r["isError"] = true;
+        j["result"] = r;
+        return j.dump();
     }
 
-    std::string line;
-    std::ostringstream out;
-    int line_no   = 0;
-    int start     = req.offset.value_or(1);
-    int max_lines = req.limit.value_or(INT_MAX);
-    int collected = 0;
+    // Detect binary via magic bytes.
+    auto ft = detect_file_type(req.path);
 
-    while (std::getline(f, line)) {
-        ++line_no;
-        if (line_no < start) continue;
-        if (collected >= max_lines) {
-            // Truncated — note it in details (overridden below).
-            resp.tool_content = out.str();
-            // Re-serialize with truncated=true handled by caller via details.
-            // Just mark in error for now via a side-channel-free approach: set
-            // a flag via a special detail appended at serialize time.
-            // Simpler: just stop here; the caller can re-request.
-            break;
+    if (ft.binary) {
+        bool is_image = (ft.mime.rfind("image/", 0) == 0);
+
+        if (is_image) {
+            // Image: read, resize if needed, return as MCP image content.
+            std::ifstream f(req.path, std::ios::binary);
+            if (!f) {
+                r["content"] = json::array({{{"type", "text"},
+                    {"text", std::string("read: cannot open file: ") + req.path +
+                             ": " + strerror(errno)}}});
+                r["isError"] = true;
+                j["result"] = r;
+                return j.dump();
+            }
+            std::string raw((std::istreambuf_iterator<char>(f)),
+                             std::istreambuf_iterator<char>());
+
+            auto img = resize_image(raw, ft.mime);
+            if (img.data.empty()) {
+                // Resize failed or unsupported image format — return metadata only.
+                std::string text = std::string("[Image: ") + ft.mime +
+                    ", " + std::to_string(raw.size()) +
+                    " bytes — could not be processed for inline display]";
+                json sc = {{"encoding", "metadata"}, {"mime_type", ft.mime},
+                           {"size", (uint64_t)raw.size()}};
+                r["content"] = json::array({{{"type", "text"}, {"text", text}}});
+                r["structuredContent"] = std::move(sc);
+            } else {
+                // Return resized image via MCP image content block.
+                std::string text = std::string("[Image: ") + img.mime_type + ", " +
+                    std::to_string(img.width) + "x" + std::to_string(img.height);
+                if (img.was_resized)
+                    text += ", resized from " + std::to_string(img.original_width) +
+                            "x" + std::to_string(img.original_height);
+                text += "]";
+                r["content"] = json::array({
+                    {{"type", "text"}, {"text", text}},
+                    {{"type", "image"}, {"data", std::move(img.data)},
+                     {"mimeType", img.mime_type}},
+                });
+                json sc = {{"encoding", "image"}, {"mime_type", img.mime_type},
+                           {"width", img.width}, {"height", img.height},
+                           {"original_width", img.original_width},
+                           {"original_height", img.original_height},
+                           {"was_resized", img.was_resized},
+                           {"size", (uint64_t)raw.size()}};
+                r["structuredContent"] = std::move(sc);
+            }
+        } else {
+            // Non-image binary: return metadata only (base64 is useless for LLMs).
+            std::string text = std::string("[Binary file: ") + ft.mime +
+                               ", " + std::to_string(st.st_size) + " bytes]";
+            json sc = {{"encoding", "metadata"}, {"mime_type", ft.mime},
+                       {"size", (uint64_t)st.st_size}};
+            r["content"] = json::array({{{"type", "text"}, {"text", text}}});
+            r["structuredContent"] = std::move(sc);
         }
-        out << line << '\n';
-        ++collected;
-    }
-    if (collected < max_lines)
-        resp.tool_content = out.str(); // only overwrite if loop finished normally
+    } else {
+        // Text mode: line-based reading with offset/limit.
+        std::ifstream f(req.path);
+        if (!f) {
+            r["content"] = json::array({{{"type", "text"},
+                {"text", std::string("read: cannot open file: ") + req.path +
+                         ": " + strerror(errno)}}});
+            r["isError"] = true;
+            j["result"] = r;
+            return j.dump();
+        }
 
-    return resp;
+        std::string line;
+        std::ostringstream out;
+        int line_no   = 0;
+        int start     = req.offset.value_or(1);
+        int max_lines = req.limit.value_or(INT_MAX);
+        int collected = 0;
+        bool truncated = false;
+
+        while (std::getline(f, line)) {
+            ++line_no;
+            if (line_no < start) continue;
+            if (collected >= max_lines) { truncated = true; break; }
+            out << line << '\n';
+            ++collected;
+        }
+
+        std::string text_content = out.str();
+        // Validate UTF-8: nlohmann::json will reject invalid UTF-8 strings.
+        // If the content is not valid UTF-8 (e.g. latin-1 detected as text
+        // by libmagic), fall back to metadata only.
+        try {
+            json sc = {{"content", text_content}, {"encoding", "text"},
+                       {"mime_type", ft.mime}, {"line_count", collected},
+                       {"truncated", truncated}};
+            // content[].text = plain text for LLM readability.
+            // structuredContent carries the same content + metadata for programmatic access.
+            r["content"] = json::array({{{"type", "text"}, {"text", text_content}}});
+            r["structuredContent"] = std::move(sc);
+        } catch (const json::exception &) {
+            // Not valid UTF-8 — treat as binary, return metadata only.
+            std::string summary = std::string("[Binary file: ") + ft.mime +
+                                  ", " + std::to_string(st.st_size) + " bytes]";
+            json sc = {{"encoding", "metadata"}, {"mime_type", ft.mime},
+                       {"size", (uint64_t)st.st_size}};
+            r["content"] = json::array({{{"type", "text"}, {"text", std::move(summary)}}});
+            r["structuredContent"] = std::move(sc);
+        }
+    }
+
+    j["result"] = r;
+    return j.dump();
 }
 
 static RpcResponse tool_write(const RpcRequest &req) {
@@ -947,21 +1025,21 @@ void rpc_run_loop(int fd_in, int fd_out, WorkerPool &pool) {
             // Extremely unlikely (fd exhaustion). Fall back to synchronous execution.
             RpcResponse resp;
             switch (req.tool) {
-                case ToolKind::Read:  resp = tool_read(req);  break;
                 case ToolKind::Write: resp = tool_write(req); break;
                 case ToolKind::Edit:  resp = tool_edit(req);  break;
                 default: break;
             }
-            // Terminal tools produce pre-serialized JSON strings.
-            std::string terminal_payload;
+            // Tools that produce pre-serialized JSON strings.
+            std::string direct_payload;
             switch (req.tool) {
-                case ToolKind::TerminalRun:  terminal_payload = tool_terminal_run(req);  break;
-                case ToolKind::TerminalSend: terminal_payload = tool_terminal_send(req); break;
-                case ToolKind::TerminalKill: terminal_payload = tool_terminal_kill(req); break;
-                case ToolKind::TerminalList: terminal_payload = tool_terminal_list(req); break;
+                case ToolKind::Read:         direct_payload = tool_read_json(req);     break;
+                case ToolKind::TerminalRun:  direct_payload = tool_terminal_run(req);  break;
+                case ToolKind::TerminalSend: direct_payload = tool_terminal_send(req); break;
+                case ToolKind::TerminalKill: direct_payload = tool_terminal_kill(req); break;
+                case ToolKind::TerminalList: direct_payload = tool_terminal_list(req); break;
                 default: break;
             }
-            if (!terminal_payload.empty()) { write_msg(terminal_payload); return; }
+            if (!direct_payload.empty()) { write_msg(direct_payload); return; }
             write_resp(resp);
             return;
         }
@@ -970,26 +1048,26 @@ void rpc_run_loop(int fd_in, int fd_out, WorkerPool &pool) {
 
         int write_fd = sv[1];
         std::thread([req, write_fd]() {
-            // Terminal tools produce pre-serialized JSON.
-            std::string terminal_payload;
+            // Tools that produce pre-serialized JSON.
+            std::string direct_payload;
             switch (req.tool) {
-                case ToolKind::TerminalRun:  terminal_payload = tool_terminal_run(req);  break;
-                case ToolKind::TerminalSend: terminal_payload = tool_terminal_send(req); break;
-                case ToolKind::TerminalKill: terminal_payload = tool_terminal_kill(req); break;
-                case ToolKind::TerminalList: terminal_payload = tool_terminal_list(req); break;
+                case ToolKind::Read:         direct_payload = tool_read_json(req);     break;
+                case ToolKind::TerminalRun:  direct_payload = tool_terminal_run(req);  break;
+                case ToolKind::TerminalSend: direct_payload = tool_terminal_send(req); break;
+                case ToolKind::TerminalKill: direct_payload = tool_terminal_kill(req); break;
+                case ToolKind::TerminalList: direct_payload = tool_terminal_list(req); break;
                 default: break;
             }
             RpcResponse resp;
-            if (terminal_payload.empty()) {
+            if (direct_payload.empty()) {
                 switch (req.tool) {
-                    case ToolKind::Read:  resp = tool_read(req);  break;
                     case ToolKind::Write: resp = tool_write(req); break;
                     case ToolKind::Edit:  resp = tool_edit(req);  break;
                     default: break;
                 }
-                terminal_payload = rpc_serialize_response(resp);
+                direct_payload = rpc_serialize_response(resp);
             }
-            std::string payload = terminal_payload + '\n';
+            std::string payload = direct_payload + '\n';
             uint32_t len = (uint32_t)payload.size();
             (void)write(write_fd, &len, 4);
             (void)write(write_fd, payload.c_str(), len);

@@ -166,7 +166,7 @@ export class BoxshClient {
      * @param {string} filePath    Absolute path to the file
      * @param {number} [offset]   1-based line number to start reading from
      * @param {number} [limit]    Maximum number of lines to return
-     * @returns {Promise<string>}
+     * @returns {Promise<{ content: string, encoding: string, mime_type: string, line_count?: number, truncated?: boolean, size?: number }>}
      */
     async read(filePath, offset, limit) {
         const args = { path: filePath };
@@ -178,7 +178,15 @@ export class BoxshClient {
             params: { name: 'read', arguments: args },
         });
         this.#checkToolError(result);
-        return result.content[0].text;
+        const sc = result.structuredContent ?? {};
+        return {
+            content:    sc.content ?? '',
+            encoding:   sc.encoding ?? 'text',
+            mime_type:  sc.mime_type ?? '',
+            ...(sc.line_count !== undefined ? { line_count: sc.line_count } : {}),
+            ...(sc.truncated  !== undefined ? { truncated: sc.truncated }  : {}),
+            ...(sc.size       !== undefined ? { size: sc.size }           : {}),
+        };
     }
 
     /**

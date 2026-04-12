@@ -21,7 +21,7 @@ function tmpFile(content = '') {
   return p;
 }
 
-/** Extract the text content from a tool response. */
+/** Extract the text content from a non-read tool response. */
 function text(resp) {
   assert.ok(Array.isArray(resp.content), 'response.content is not an array');
   assert.ok(resp.content.length > 0, 'response.content is empty');
@@ -38,7 +38,7 @@ describe('tool — read', () => {
     try {
       const resp = rpc({ id: '1', tool: 'read', path: p });
       assert.ok(!resp.error, `unexpected error: ${resp.error}`);
-      assert.equal(text(resp), 'hello\nworld\n');
+      assert.equal(resp.content, 'hello\nworld\n');
     } finally { fs.rmSync(p, { force: true }); }
   });
 
@@ -47,7 +47,7 @@ describe('tool — read', () => {
     try {
       const resp = rpc({ id: '1', tool: 'read', path: p, offset: 2 });
       assert.ok(!resp.error, `unexpected error: ${resp.error}`);
-      assert.equal(text(resp), 'line2\nline3\n');
+      assert.equal(resp.content, 'line2\nline3\n');
     } finally { fs.rmSync(p, { force: true }); }
   });
 
@@ -56,7 +56,7 @@ describe('tool — read', () => {
     try {
       const resp = rpc({ id: '1', tool: 'read', path: p, limit: 2 });
       assert.ok(!resp.error, `unexpected error: ${resp.error}`);
-      assert.equal(text(resp), 'a\nb\n');
+      assert.equal(resp.content, 'a\nb\n');
     } finally { fs.rmSync(p, { force: true }); }
   });
 
@@ -65,7 +65,7 @@ describe('tool — read', () => {
     try {
       const resp = rpc({ id: '1', tool: 'read', path: p, offset: 2, limit: 2 });
       assert.ok(!resp.error, `unexpected error: ${resp.error}`);
-      assert.equal(text(resp), 'b\nc\n');
+      assert.equal(resp.content, 'b\nc\n');
     } finally { fs.rmSync(p, { force: true }); }
   });
 
@@ -75,12 +75,112 @@ describe('tool — read', () => {
     assert.match(resp.error, /read:/);
   });
 
-  test('response includes details with line_count', () => {
+  test('response includes encoding and mime_type for text', () => {
     const p = tmpFile('x\ny\nz\n');
     try {
       const resp = rpc({ id: '1', tool: 'read', path: p });
       assert.ok(!resp.error, `unexpected error: ${resp.error}`);
-      assert.ok(resp.truncation?.line_count >= 3, 'expected line_count >= 3');
+      assert.equal(resp.encoding, 'text');
+      assert.equal(typeof resp.mime_type, 'string');
+      assert.ok(resp.mime_type.startsWith('text/'), `expected text/* mime, got ${resp.mime_type}`);
+    } finally { fs.rmSync(p, { force: true }); }
+  });
+
+  test('response includes line_count', () => {
+    const p = tmpFile('x\ny\nz\n');
+    try {
+      const resp = rpc({ id: '1', tool: 'read', path: p });
+      assert.ok(!resp.error, `unexpected error: ${resp.error}`);
+      assert.ok(resp.line_count >= 3, 'expected line_count >= 3');
+    } finally { fs.rmSync(p, { force: true }); }
+  });
+
+  test('truncated field is false when not truncated', () => {
+    const p = tmpFile('a\nb\n');
+    try {
+      const resp = rpc({ id: '1', tool: 'read', path: p });
+      assert.ok(!resp.error, `unexpected error: ${resp.error}`);
+      assert.equal(resp.truncated, false);
+    } finally { fs.rmSync(p, { force: true }); }
+  });
+
+  test('truncated field is true when limit reached', () => {
+    const p = tmpFile('a\nb\nc\nd\n');
+    try {
+      const resp = rpc({ id: '1', tool: 'read', path: p, limit: 2 });
+      assert.ok(!resp.error, `unexpected error: ${resp.error}`);
+      assert.equal(resp.truncated, true);
+      assert.equal(resp.line_count, 2);
+    } finally { fs.rmSync(p, { force: true }); }
+  });
+
+  test('reads binary image as metadata (truncated image)', () => {
+    // Create a small PNG-like binary file (too small for stb to decode).
+    const p = path.join(os.tmpdir(),
+      `boxsh-bin-${process.pid}-${Math.random().toString(36).slice(2)}.bin`);
+    const buf = Buffer.from([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A,
+                             0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52]);
+    fs.writeFileSync(p, buf);
+    try {
+      const resp = rpc({ id: '1', tool: 'read', path: p });
+      assert.ok(!resp.error, `unexpected error: ${resp.error}`);
+      // Truncated PNG — stb can't decode, falls back to metadata.
+      assert.equal(resp.encoding, 'metadata');
+      assert.equal(resp.mime_type, 'image/png');
+      assert.equal(resp.size, 16);
+    } finally { fs.rmSync(p, { force: true }); }
+  });
+
+  test('binary file has mime_type and size', () => {
+    const p = path.join(os.tmpdir(),
+      `boxsh-bin-${process.pid}-${Math.random().toString(36).slice(2)}.bin`);
+    // Use a GIF header to ensure detection identifies it as binary.
+    const buf = Buffer.from('GIF89a' + '\x00'.repeat(58));
+    fs.writeFileSync(p, buf);
+    try {
+      const resp = rpc({ id: '1', tool: 'read', path: p });
+      assert.ok(!resp.error, `unexpected error: ${resp.error}`);
+      assert.equal(resp.encoding, 'metadata');
+      assert.equal(typeof resp.mime_type, 'string');
+      assert.equal(resp.size, 64);
+    } finally { fs.rmSync(p, { force: true }); }
+  });
+
+  test('ELF binary detected correctly', () => {
+    const p = path.join(os.tmpdir(),
+      `boxsh-elf-${process.pid}-${Math.random().toString(36).slice(2)}.bin`);
+    // ELF magic header.
+    const buf = Buffer.from([0x7F, 0x45, 0x4C, 0x46, 0x02, 0x01, 0x01, 0x00,
+                             0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
+    fs.writeFileSync(p, buf);
+    try {
+      const resp = rpc({ id: '1', tool: 'read', path: p });
+      assert.ok(!resp.error, `unexpected error: ${resp.error}`);
+      assert.equal(resp.encoding, 'metadata');
+      assert.ok(resp.mime_type.includes('elf') || resp.mime_type.includes('executable') ||
+                resp.mime_type.includes('octet'), `expected binary mime, got ${resp.mime_type}`);
+    } finally { fs.rmSync(p, { force: true }); }
+  });
+
+  test('JSON file detected as text', () => {
+    const p = path.join(os.tmpdir(),
+      `boxsh-json-${process.pid}-${Math.random().toString(36).slice(2)}.json`);
+    fs.writeFileSync(p, '{"key": "value"}\n');
+    try {
+      const resp = rpc({ id: '1', tool: 'read', path: p });
+      assert.ok(!resp.error, `unexpected error: ${resp.error}`);
+      assert.equal(resp.encoding, 'text');
+      assert.equal(resp.content, '{"key": "value"}\n');
+    } finally { fs.rmSync(p, { force: true }); }
+  });
+
+  test('empty file reads as text', () => {
+    const p = tmpFile('');
+    try {
+      const resp = rpc({ id: '1', tool: 'read', path: p });
+      assert.ok(!resp.error, `unexpected error: ${resp.error}`);
+      assert.equal(resp.encoding, 'text');
+      assert.equal(resp.content, '');
     } finally { fs.rmSync(p, { force: true }); }
   });
 });

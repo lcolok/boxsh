@@ -35,6 +35,15 @@ export interface TerminalSession {
     rows: number;
 }
 
+export interface ReadResult {
+    content: string;
+    encoding: string;
+    mime_type: string;
+    line_count?: number;
+    truncated?: boolean;
+    size?: number;
+}
+
 export interface RunInTerminalOptions {
     explanation?: string;
     goal?: string;
@@ -55,7 +64,7 @@ export interface Change {
 export class BoxshClient {
     constructor(options?: BoxshClientOptions);
     exec(cmd: string, cwd?: string, timeout?: number): Promise<ExecResult>;
-    read(filePath: string, offset?: number, limit?: number): Promise<string>;
+    read(filePath: string, offset?: number, limit?: number): Promise<ReadResult>;
     write(filePath: string, content: string): Promise<void>;
     edit(filePath: string, edits: EditOperation[]): Promise<EditResult>;
     runInTerminal(command: string, opts?: RunInTerminalOptions): Promise<RunInTerminalResult>;
