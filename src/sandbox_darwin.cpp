@@ -215,6 +215,29 @@ static std::string build_sbpl(const SandboxConfig &cfg) {
         }
     }
 
+    // Protect dangerous dotfiles from writes.
+    // Even when $HOME is RW-bound, shell config files and tool config
+    // files must not be writable to prevent persistent backdoors that
+    // survive sandbox teardown (e.g. injecting commands into .bashrc).
+    // In SBPL, explicit deny rules override allow rules for the same
+    // operation, so these take effect even after (allow file-write*
+    // (subpath "$HOME")).
+    {
+        const char *home_env = getenv("HOME");
+        if (home_env && home_env[0] != '\0') {
+            std::string home = resolve_path(home_env);
+            static const char *const dangerous_files[] = {
+                ".bashrc", ".bash_profile", ".profile",
+                ".zshrc", ".zprofile",
+                ".gitconfig", ".mcp.json", nullptr
+            };
+            for (int i = 0; dangerous_files[i]; i++) {
+                p += "(deny file-write* (literal \""
+                   + home + "/" + dangerous_files[i] + "\"))\n";
+            }
+        }
+    }
+
     // Network: allow by default; deny everything when --new-net-ns is set.
     if (!cfg.new_net_ns) {
         p += "(allow network*)\n";

@@ -11,11 +11,16 @@
 #include <unistd.h>
 #include <sched.h>
 #include <sys/mount.h>
+#include <sys/prctl.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <dirent.h>
+#include <linux/seccomp.h>
+#include <linux/filter.h>
+#include <linux/audit.h>
+#include <stddef.h>
 
 namespace boxsh {
 
@@ -255,16 +260,17 @@ static bool setup_system_mounts(const std::string &new_root, std::string &err) {
         }
     }
 
-    // /proc — bind-mount from host; works in user namespace without new PID ns.
-    // A fresh proc mount requires CAP_SYS_ADMIN beyond user-ns scope on some
-    // kernels; a bind-mount is always allowed with CLONE_NEWNS.
+    // /proc — mount a fresh procfs that only shows processes in our PID
+    // namespace.  This prevents leaking host process information (cmdline,
+    // environ, memory maps) which would be exposed by a bind-mount of the
+    // host's /proc.
     if (mkdir((new_root + "/proc").c_str(), 0755) != 0 && errno != EEXIST) {
         err = errno_str("mkdir /proc");
         return false;
     }
-    if (mount("/proc", (new_root + "/proc").c_str(), nullptr,
-              MS_BIND | MS_REC, nullptr) != 0) {
-        err = errno_str("bind /proc");
+    if (mount("proc", (new_root + "/proc").c_str(), "proc",
+              MS_NOSUID | MS_NODEV | MS_NOEXEC, nullptr) != 0) {
+        err = errno_str("mount proc");
         return false;
     }
 
@@ -317,7 +323,10 @@ SandboxResult sandbox_apply(const SandboxConfig &cfg) {
     uint32_t host_gid = (uint32_t)getgid();
 
     // --- 1. Unshare namespaces ---
-    int unshare_flags = CLONE_NEWNS | CLONE_NEWUSER;
+    // CLONE_NEWPID isolates the process tree: the next fork()'d child becomes
+    // PID 1 in a new PID namespace.  Host processes are invisible, and signals
+    // cannot escape the namespace boundary.
+    int unshare_flags = CLONE_NEWNS | CLONE_NEWUSER | CLONE_NEWPID;
     if (cfg.new_net_ns)  unshare_flags |= CLONE_NEWNET;
 
     if (unshare(unshare_flags) != 0) {
@@ -352,6 +361,50 @@ SandboxResult sandbox_apply(const SandboxConfig &cfg) {
     if (mount(nullptr, "/", nullptr, MS_SLAVE | MS_REC, nullptr) != 0) {
         res.error = errno_str("mount --make-rslave /");
         return res;
+    }
+
+    // --- 3b. Fork into the new PID namespace ---
+    // CLONE_NEWPID only affects children: the next fork()'d child becomes
+    // PID 1 in the new PID namespace.  The parent stays in the old namespace
+    // and acts as a simple wait-and-forward wrapper.
+    {
+        pid_t child = fork();
+        if (child < 0) {
+            res.error = errno_str("fork for PID namespace");
+            return res;
+        }
+        if (child > 0) {
+            // Parent: forward signals to child, wait for it, then _exit.
+            // This process never returns from sandbox_apply().
+            static volatile pid_t g_sandbox_child = child;
+            auto fwd = [](int sig) {
+                kill(g_sandbox_child, sig);
+            };
+            signal(SIGTERM, fwd);
+            signal(SIGINT,  fwd);
+            signal(SIGHUP,  fwd);
+
+            int status = 0;
+            while (waitpid(child, &status, 0) < 0 && errno == EINTR) {}
+
+            if (WIFEXITED(status))   _exit(WEXITSTATUS(status));
+            if (WIFSIGNALED(status)) _exit(128 + WTERMSIG(status));
+            _exit(1);
+        }
+        // Child: now PID 1 in the new PID namespace.
+
+        // Prevent ptrace attachment from outside the namespace.
+        prctl(PR_SET_DUMPABLE, 0);
+
+        // As PID 1, we must reap orphaned child processes to prevent zombie
+        // accumulation.  Install a SIGCHLD handler that reaps all finished
+        // children asynchronously.
+        struct sigaction sa = {};
+        sa.sa_handler = [](int) {
+            while (waitpid(-1, nullptr, WNOHANG) > 0) {}
+        };
+        sa.sa_flags = SA_RESTART | SA_NOCLDSTOP;
+        sigaction(SIGCHLD, &sa, nullptr);
     }
 
     // --- 4. Build new root on a tmpfs ---
@@ -434,6 +487,32 @@ SandboxResult sandbox_apply(const SandboxConfig &cfg) {
             return res;
     }
 
+    // --- 8. Protect dangerous dotfiles from writes ---
+    // Even when $HOME is exposed read-write, shell config files and tool
+    // config files must be read-only to prevent persistent backdoors that
+    // survive sandbox teardown (e.g. injecting commands into .bashrc).
+    {
+        const char *home_env = getenv("HOME");
+        if (home_env && home_env[0] != '\0') {
+            static const char *const dangerous_files[] = {
+                ".bashrc", ".bash_profile", ".profile", ".zshrc", ".zprofile",
+                ".gitconfig", ".mcp.json", nullptr
+            };
+            std::string home(home_env);
+            for (int i = 0; dangerous_files[i]; i++) {
+                std::string host_path = home + "/" + dangerous_files[i];
+                std::string sandbox_path = new_root + host_path;
+                struct stat st;
+                if (stat(sandbox_path.c_str(), &st) == 0) {
+                    // Re-bind as read-only on top of the existing mount.
+                    bind_mount(host_path, sandbox_path, /*readonly=*/true, res.error);
+                    // Ignore errors: file may not exist on host.
+                    res.error.clear();
+                }
+            }
+        }
+    }
+
     // --- 10. pivot_root into new_root ---
     // Bind new_root onto itself so it is a mount point (pivot_root requirement).
     if (mount(new_root.c_str(), new_root.c_str(), nullptr,
@@ -493,6 +572,97 @@ SandboxResult sandbox_apply(const SandboxConfig &cfg) {
         if (!restore_path.empty() && chdir(restore_path.c_str()) != 0) {
             chdir("/");
         }
+    }
+
+    // --- 12. Apply seccomp-bpf syscall filter ---
+    // Block dangerous syscalls that could be used to escape the sandbox:
+    //   - socket(AF_UNIX, ...) — prevents connecting to Docker, SSH agent, D-Bus
+    //   - io_uring_setup/enter/register — prevents bypassing seccomp via io_uring
+    {
+        // AUDIT_ARCH_* must match the target: use compiler-defined arch macros.
+#if defined(__x86_64__)
+#define BOXSH_AUDIT_ARCH AUDIT_ARCH_X86_64
+#elif defined(__aarch64__)
+#define BOXSH_AUDIT_ARCH AUDIT_ARCH_AARCH64
+#elif defined(__i386__)
+#define BOXSH_AUDIT_ARCH AUDIT_ARCH_I386
+#elif defined(__arm__)
+#define BOXSH_AUDIT_ARCH AUDIT_ARCH_ARM
+#elif defined(__mips64)
+#define BOXSH_AUDIT_ARCH AUDIT_ARCH_MIPSEL64
+#elif defined(__powerpc64__)
+#define BOXSH_AUDIT_ARCH AUDIT_ARCH_PPC64LE
+#elif defined(__riscv) && (__riscv_xlen == 64)
+#define BOXSH_AUDIT_ARCH AUDIT_ARCH_RISCV64
+#elif defined(__loongarch64)
+#define BOXSH_AUDIT_ARCH AUDIT_ARCH_LOONGARCH64
+#else
+#warning "seccomp: unsupported architecture, skipping filter"
+#endif
+
+        // Syscall numbers come from <sys/syscall.h> — automatically correct
+        // for the target architecture, no manual table needed.
+#ifndef __NR_io_uring_setup
+#define __NR_io_uring_setup    425
+#endif
+#ifndef __NR_io_uring_enter
+#define __NR_io_uring_enter    426
+#endif
+#ifndef __NR_io_uring_register
+#define __NR_io_uring_register 427
+#endif
+
+#ifdef BOXSH_AUDIT_ARCH
+        struct sock_filter filter[] = {
+            // [0] Load architecture
+            BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, arch)),
+            // [1] Check architecture matches — if not, allow (skip to ALLOW)
+            BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, BOXSH_AUDIT_ARCH, 0, 9),
+
+            // [2] Load syscall number
+            BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, nr)),
+
+            // [3] Check io_uring_setup
+            BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_io_uring_setup, 6, 0),
+            // [4] Check io_uring_enter
+            BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_io_uring_enter, 5, 0),
+            // [5] Check io_uring_register
+            BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_io_uring_register, 4, 0),
+
+            // [6] Check if socket syscall
+            BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_socket, 0, 4),
+
+            // [7] socket() — load first argument (domain/family)
+            BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, args[0])),
+            // [8] If AF_UNIX (1), block it
+            BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 1 /*AF_UNIX*/, 0, 2),
+
+            // [9] Block: return EPERM
+            BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | 1 /*EPERM*/),
+
+            // [10] Also block (for io_uring): return EPERM
+            BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | 1 /*EPERM*/),
+
+            // [11] Allow
+            BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+        };
+
+        struct sock_fprog prog = {
+            .len = (unsigned short)(sizeof(filter) / sizeof(filter[0])),
+            .filter = filter,
+        };
+
+        // Allow the process to install seccomp filters without CAP_SYS_ADMIN.
+        if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0) {
+            res.error = errno_str("prctl PR_SET_NO_NEW_PRIVS");
+            return res;
+        }
+        if (prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &prog) != 0) {
+            res.error = errno_str("prctl PR_SET_SECCOMP");
+            return res;
+        }
+#endif
+#undef BOXSH_AUDIT_ARCH
     }
 
     res.ok = true;
