@@ -43,6 +43,30 @@ static std::string resolve_path(const std::string &path) {
     return r ? std::string(r) : path;
 }
 
+static std::string escape_regex(const std::string &value) {
+    std::string escaped;
+    escaped.reserve(value.size() * 2);
+    for (char ch : value) {
+        switch (ch) {
+        case '\\':
+        case '.':
+        case '^':
+        case '$':
+        case '|':
+        case '(': case ')':
+        case '[': case ']':
+        case '{': case '}':
+        case '*': case '+': case '?':
+            escaped.push_back('\\');
+            break;
+        default:
+            break;
+        }
+        escaped.push_back(ch);
+    }
+    return escaped;
+}
+
 // True if path equals prefix or starts with prefix + '/'.
 static bool is_under(const std::string &path, const std::string &prefix) {
     return path == prefix ||
@@ -229,13 +253,14 @@ static std::string build_sbpl(const SandboxConfig &cfg) {
             static const char *const dangerous_files[] = {
                 ".bashrc", ".bash_profile", ".profile",
                 ".zshrc", ".zprofile",
-                ".gitconfig", ".mcp.json", ".npmrc",
+                ".gitconfig", ".gitmodules", ".ripgreprc",
+                ".mcp.json", ".npmrc",
                 ".aws/credentials", ".pip/pip.conf",
-                ".cargo/credentials.toml", ".ssh/authorized_keys",
+                ".cargo/credentials.toml",
                 nullptr
             };
             static const char *const dangerous_dirs[] = {
-                ".config/gcloud", ".gnupg", nullptr
+                ".ssh", ".gnupg", ".config/gcloud", nullptr
             };
             for (int i = 0; dangerous_files[i]; i++) {
                 p += "(deny file-write* (literal \""
@@ -245,6 +270,12 @@ static std::string build_sbpl(const SandboxConfig &cfg) {
                 p += "(deny file-write* (subpath \""
                    + home + "/" + dangerous_dirs[i] + "\"))\n";
             }
+
+            // Block Git hooks anywhere under $HOME, including newly created
+            // repositories and hook files inside nested worktrees.
+            p += "(deny file-write* (regex \"^"
+               + escape_regex(home)
+               + "/(.*/)?\\.git/hooks(/.*)?$\"))\n";
         }
     }
 

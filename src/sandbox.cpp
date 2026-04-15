@@ -4,6 +4,7 @@
 #include <cstring>
 #include <cstdio>
 #include <cstdlib>
+#include <algorithm>
 #include <set>
 #include <vector>
 
@@ -31,6 +32,11 @@ namespace boxsh {
 static std::string path_parent(const std::string &p);
 static bool bind_mount(const std::string &src, const std::string &dst,
                        bool readonly, std::string &err);
+
+enum class ProtectedPathKind {
+    File,
+    Directory,
+};
 
 static std::string errno_str(const char *context) {
     return std::string(context) + ": " + std::strerror(errno);
@@ -64,6 +70,11 @@ static bool path_exists(const std::string &path) {
     return stat(path.c_str(), &st) == 0;
 }
 
+static bool path_lexists(const std::string &path) {
+    struct stat st;
+    return lstat(path.c_str(), &st) == 0;
+}
+
 static bool ensure_file_mountpoint(const std::string &path, std::string &err) {
     int fd = open(path.c_str(), O_CREAT | O_WRONLY | O_CLOEXEC, 0444);
     if (fd < 0 && errno != EEXIST) {
@@ -89,9 +100,146 @@ static bool protect_path_readonly(const std::string &host_path,
     return bind_mount(host_path, sandbox_path, /*readonly=*/true, err);
 }
 
-static bool protect_existing_git_hook_dirs(const std::string &home,
-                                           const std::string &new_root,
-                                           std::string &err) {
+static bool ensure_protection_sources(const std::string &new_root,
+                                      std::string &empty_dir,
+                                      std::string &empty_file,
+                                      std::string &err) {
+    std::string base = new_root + "/.boxsh-protect";
+    if (!mkdir_p(base, 0755, err)) return false;
+
+    empty_dir = base + "/empty-dir";
+    if (!mkdir_p(empty_dir, 0755, err)) return false;
+
+    empty_file = base + "/empty-file";
+    if (!ensure_file_mountpoint(empty_file, err)) return false;
+
+    return true;
+}
+
+static bool write_cleanup_path(int fd, const std::string &path,
+                               std::string &err) {
+    if (fd < 0) return true;
+
+    size_t off = 0;
+    const size_t len = path.size() + 1;
+    const char *data = path.c_str();
+    while (off < len) {
+        ssize_t n = write(fd, data + off, len - off);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            err = errno_str("write cleanup path");
+            return false;
+        }
+        off += static_cast<size_t>(n);
+    }
+    return true;
+}
+
+static bool has_non_directory_ancestor(const std::string &path) {
+    std::string current;
+    size_t pos = 1;
+    while (pos <= path.size()) {
+        size_t next = path.find('/', pos);
+        if (next == std::string::npos) next = path.size();
+        current = path.substr(0, next);
+        if (current.empty()) {
+            pos = next + 1;
+            continue;
+        }
+
+        struct stat st;
+        if (lstat(current.c_str(), &st) != 0) return false;
+        if (!S_ISDIR(st.st_mode)) return true;
+
+        pos = next + 1;
+    }
+    return false;
+}
+
+static std::string find_first_missing_component(const std::string &path) {
+    std::string current;
+    size_t pos = 1;
+    while (pos <= path.size()) {
+        size_t next = path.find('/', pos);
+        if (next == std::string::npos) next = path.size();
+        current = path.substr(0, next);
+        if (current.empty()) {
+            pos = next + 1;
+            continue;
+        }
+
+        struct stat st;
+        if (lstat(current.c_str(), &st) != 0) return current;
+        pos = next + 1;
+    }
+    return path;
+}
+
+static bool ensure_host_dir_mountpoint(const std::string &path, std::string &err) {
+    if (mkdir(path.c_str(), 0755) != 0 && errno != EEXIST) {
+        err = errno_str(("create protected dir mountpoint: " + path).c_str());
+        return false;
+    }
+    return true;
+}
+
+static bool protect_missing_path_readonly(const std::string &host_path,
+                                          const std::string &new_root,
+                                          ProtectedPathKind kind,
+                                          const std::string &empty_dir,
+                                          const std::string &empty_file,
+                                          int cleanup_fd,
+                                          std::string &err) {
+    if (has_non_directory_ancestor(host_path)) return true;
+
+    std::string first_missing = find_first_missing_component(host_path);
+    bool mount_as_dir = (kind == ProtectedPathKind::Directory) ||
+                        (first_missing != host_path);
+
+    if (!path_lexists(first_missing)) {
+        if (mount_as_dir) {
+            if (!ensure_host_dir_mountpoint(first_missing, err)) return false;
+        } else {
+            if (!ensure_file_mountpoint(first_missing, err)) return false;
+        }
+        if (!write_cleanup_path(cleanup_fd, first_missing, err)) return false;
+    }
+
+    return bind_mount(mount_as_dir ? empty_dir : empty_file,
+                      new_root + first_missing,
+                      /*readonly=*/true,
+                      err);
+}
+
+static bool protect_path_deny_write(const std::string &host_path,
+                                    const std::string &new_root,
+                                    ProtectedPathKind kind,
+                                    const std::string &empty_dir,
+                                    const std::string &empty_file,
+                                    int cleanup_fd,
+                                    std::string &err) {
+    if (path_lexists(host_path)) {
+        return protect_path_readonly(host_path,
+                                     new_root,
+                                     kind == ProtectedPathKind::Directory,
+                                     err);
+    }
+
+    return protect_missing_path_readonly(host_path,
+                                         new_root,
+                                         kind,
+                                         empty_dir,
+                                         empty_file,
+                                         cleanup_fd,
+                                         err);
+}
+
+static bool protect_git_hook_paths(const std::string &home,
+                                   const std::string &new_root,
+                                   const std::string &empty_dir,
+                                   const std::string &empty_file,
+                                   int cleanup_fd,
+                                   std::string &err) {
     std::vector<std::string> stack;
     stack.push_back(home);
 
@@ -117,12 +265,15 @@ static bool protect_existing_git_hook_dirs(const std::string &home,
 
             if (std::strcmp(ent->d_name, ".git") == 0) {
                 std::string hooks = child + "/hooks";
-                struct stat hooks_st;
-                if (stat(hooks.c_str(), &hooks_st) == 0 && S_ISDIR(hooks_st.st_mode)) {
-                    if (!protect_path_readonly(hooks, new_root, /*is_dir=*/true, err)) {
-                        closedir(d);
-                        return false;
-                    }
+                if (!protect_path_deny_write(hooks,
+                                             new_root,
+                                             ProtectedPathKind::Directory,
+                                             empty_dir,
+                                             empty_file,
+                                             cleanup_fd,
+                                             err)) {
+                    closedir(d);
+                    return false;
                 }
                 continue;
             }
@@ -155,6 +306,57 @@ static bool path_writable_via_bind(const SandboxConfig &cfg,
         if (path_intersects(path, bm.dst)) return true;
     }
     return false;
+}
+
+static std::vector<std::string> read_cleanup_paths(int fd) {
+    std::vector<std::string> paths;
+    std::string current;
+    char buf[512];
+
+    if (fd < 0) return paths;
+    lseek(fd, 0, SEEK_SET);
+
+    for (;;) {
+        ssize_t n = read(fd, buf, sizeof(buf));
+        if (n == 0) break;
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+
+        for (ssize_t i = 0; i < n; ++i) {
+            if (buf[i] == '\0') {
+                if (!current.empty()) {
+                    paths.push_back(current);
+                    current.clear();
+                }
+            } else {
+                current.push_back(buf[i]);
+            }
+        }
+    }
+
+    if (!current.empty()) paths.push_back(current);
+    return paths;
+}
+
+static void cleanup_host_mountpoints(std::vector<std::string> paths) {
+    std::sort(paths.begin(), paths.end());
+    paths.erase(std::unique(paths.begin(), paths.end()), paths.end());
+    std::sort(paths.begin(), paths.end(),
+              [](const std::string &a, const std::string &b) {
+                  return a.size() > b.size();
+              });
+
+    for (const auto &path : paths) {
+        struct stat st;
+        if (lstat(path.c_str(), &st) != 0) continue;
+        if (S_ISDIR(st.st_mode)) {
+            rmdir(path.c_str());
+        } else {
+            unlink(path.c_str());
+        }
+    }
 }
 
 // pivot_root(2) is not wrapped by glibc, call it directly.
@@ -209,6 +411,32 @@ static bool try_fuse_overlayfs(const std::string &lowerdir,
               std::to_string(WIFEXITED(status) ? WEXITSTATUS(status) : -1);
         return false;
     }
+    return true;
+}
+
+static bool create_cleanup_file(int &fd, std::string &err) {
+    char path[] = "/tmp/boxsh-cleanup-XXXXXX";
+    fd = mkstemp(path);
+    if (fd < 0) {
+        err = errno_str("mkstemp cleanup file");
+        return false;
+    }
+
+    if (unlink(path) != 0) {
+        err = errno_str("unlink cleanup file");
+        close(fd);
+        fd = -1;
+        return false;
+    }
+
+    int flags = fcntl(fd, F_GETFD);
+    if (flags < 0 || fcntl(fd, F_SETFD, flags | FD_CLOEXEC) != 0) {
+        err = errno_str("fcntl cleanup file cloexec");
+        close(fd);
+        fd = -1;
+        return false;
+    }
+
     return true;
 }
 
@@ -467,6 +695,11 @@ SandboxResult sandbox_apply(const SandboxConfig &cfg) {
         return res;
     }
 
+    int cleanup_fd = -1;
+    if (!create_cleanup_file(cleanup_fd, res.error)) {
+        return res;
+    }
+
     // --- 3b. Fork into the new PID namespace ---
     // CLONE_NEWPID only affects children: the next fork()'d child becomes
     // PID 1 in the new PID namespace.  The parent stays in the old namespace
@@ -474,6 +707,7 @@ SandboxResult sandbox_apply(const SandboxConfig &cfg) {
     {
         pid_t child = fork();
         if (child < 0) {
+            close(cleanup_fd);
             res.error = errno_str("fork for PID namespace");
             return res;
         }
@@ -490,6 +724,10 @@ SandboxResult sandbox_apply(const SandboxConfig &cfg) {
 
             int status = 0;
             while (waitpid(child, &status, 0) < 0 && errno == EINTR) {}
+
+            std::vector<std::string> cleanup_paths = read_cleanup_paths(cleanup_fd);
+            close(cleanup_fd);
+            cleanup_host_mountpoints(cleanup_paths);
 
             if (WIFEXITED(status))   _exit(WEXITSTATUS(status));
             if (WIFSIGNALED(status)) _exit(128 + WTERMSIG(status));
@@ -510,6 +748,13 @@ SandboxResult sandbox_apply(const SandboxConfig &cfg) {
         sa.sa_flags = SA_RESTART | SA_NOCLDSTOP;
         sigaction(SIGCHLD, &sa, nullptr);
     }
+
+    struct CleanupPipeCloser {
+        int fd;
+        ~CleanupPipeCloser() {
+            if (fd >= 0) close(fd);
+        }
+    } cleanup_pipe_closer{cleanup_fd};
 
     // --- 4. Build new root on a tmpfs ---
     // We use /tmp as staging area (same approach as bubblewrap).
@@ -600,10 +845,20 @@ SandboxResult sandbox_apply(const SandboxConfig &cfg) {
         if (home_env && home_env[0] != '\0') {
             std::string home(home_env);
             if (path_exists(new_root + home) && path_writable_via_bind(cfg, home)) {
+                std::string empty_dir;
+                std::string empty_file;
+                if (!ensure_protection_sources(new_root,
+                                               empty_dir,
+                                               empty_file,
+                                               res.error)) {
+                    return res;
+                }
+
                 static const char *const dangerous_files[] = {
                     ".bashrc", ".bash_profile", ".profile",
                     ".zshrc", ".zprofile",
-                    ".gitconfig", ".mcp.json", ".npmrc",
+                    ".gitconfig", ".gitmodules", ".ripgreprc",
+                    ".mcp.json", ".npmrc",
                     ".aws/credentials", ".pip/pip.conf",
                     ".cargo/credentials.toml",
                     nullptr
@@ -615,26 +870,37 @@ SandboxResult sandbox_apply(const SandboxConfig &cfg) {
                 for (int i = 0; dangerous_files[i]; i++) {
                     std::string protected_path = home + "/" + dangerous_files[i];
                     if (!path_writable_via_bind(cfg, protected_path)) continue;
-                    if (!protect_path_readonly(protected_path,
-                                               new_root,
-                                               /*is_dir=*/false,
-                                               res.error)) {
+                    if (!protect_path_deny_write(protected_path,
+                                                 new_root,
+                                                 ProtectedPathKind::File,
+                                                 empty_dir,
+                                                 empty_file,
+                                                 cleanup_fd,
+                                                 res.error)) {
                         return res;
                     }
                 }
                 for (int i = 0; dangerous_dirs[i]; i++) {
                     std::string protected_path = home + "/" + dangerous_dirs[i];
                     if (!path_writable_via_bind(cfg, protected_path)) continue;
-                    if (!protect_path_readonly(protected_path,
-                                               new_root,
-                                               /*is_dir=*/true,
-                                               res.error)) {
+                    if (!protect_path_deny_write(protected_path,
+                                                 new_root,
+                                                 ProtectedPathKind::Directory,
+                                                 empty_dir,
+                                                 empty_file,
+                                                 cleanup_fd,
+                                                 res.error)) {
                         return res;
                     }
                 }
 
                 if (path_writable_via_bind(cfg, home) &&
-                    !protect_existing_git_hook_dirs(home, new_root, res.error)) {
+                    !protect_git_hook_paths(home,
+                                            new_root,
+                                            empty_dir,
+                                            empty_file,
+                                            cleanup_fd,
+                                            res.error)) {
                     return res;
                 }
             }

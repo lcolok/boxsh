@@ -221,4 +221,31 @@ describe('worker pool — large batches', () => {
       assert.equal(m[`s${i}`].stdout, `seq-${i}\n`);
     }
   });
+
+  test('concurrent multi-megabyte responses do not trigger worker respawn loop', () => {
+    const mib = 1024 * 1024;
+    const reqs = [
+      { id: 'bigA', cmd: 'dd if=/dev/zero bs=1048576 count=6 2>/dev/null | tr "\\0" A' },
+      { id: 'bigB', cmd: 'dd if=/dev/zero bs=1048576 count=6 2>/dev/null | tr "\\0" B' },
+      { id: 'bigC', cmd: 'dd if=/dev/zero bs=1048576 count=6 2>/dev/null | tr "\\0" C' },
+      { id: 'bigD', cmd: 'dd if=/dev/zero bs=1048576 count=6 2>/dev/null | tr "\\0" D' },
+    ];
+    const resps = rpcMany(reqs, { workers: 4, timeout_ms: 60000 });
+    assert.equal(resps.length, 4);
+    const m = byId(resps);
+
+    for (const [id, expectedChar] of [['bigA', 'A'], ['bigB', 'B'], ['bigC', 'C'], ['bigD', 'D']]) {
+      const resp = m[id];
+      assert.ok(!resp.error, `unexpected error for ${id}: ${resp.error}`);
+      assert.equal(resp.exit_code, 0, `unexpected exit_code for ${id}`);
+      assert.equal(resp.stdout.length, 6 * mib, `unexpected stdout length for ${id}`);
+      assert.ok(new RegExp(`^${expectedChar}+$`).test(resp.stdout),
+        `stdout for ${id} contains unexpected characters`);
+      assert.equal(resp.stdout[0], expectedChar, `unexpected first byte for ${id}`);
+      assert.equal(resp.stdout[resp.stdout.length - 1], expectedChar,
+        `unexpected last byte for ${id}`);
+      assert.ok(!String(resp.stderr).includes('worker crash, respawned'),
+        `worker respawn detected in stderr for ${id}`);
+    }
+  });
 });

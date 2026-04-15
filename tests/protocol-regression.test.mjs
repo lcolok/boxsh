@@ -238,6 +238,20 @@ describe('protocol — initialize handshake', () => {
 // ---------------------------------------------------------------------------
 
 describe('protocol — error distinction', () => {
+  test('oversized newline-mode request is rejected at 64 MiB bound', () => {
+    const oversized = Buffer.alloc(64 * 1024 * 1024 + 1024, 0x61);
+    const r = spawnSync(BOXSH, ['--rpc', '--workers', '1'], {
+      input: oversized,
+      timeout: 15000,
+      maxBuffer: 8 * 1024 * 1024,
+    });
+    assert.equal(r.signal, null, `boxsh killed by signal ${r.signal}`);
+    const resp = JSON.parse(r.stdout.toString('utf8').trim());
+    assert.ok(resp.error, 'expected JSON-RPC error response');
+    assert.ok(resp.error.message.includes('request buffer exceeded 64 MiB'),
+      `unexpected error message: ${resp.error.message}`);
+  });
+
   test('invalid JSON returns JSON-RPC error (not result with isError)', () => {
     const r = run(['--rpc', '--workers', '1'], 'not-json\n');
     const resp = JSON.parse(r.stdout.trim());

@@ -11,7 +11,7 @@
  *   Phase 7 — /proc information leakage (Linux)
  *   Phase 8 — ptrace protection (Linux)
  *   Phase 9 — PID 1 zombie reaping (Linux)
- *   Phase 10 — Dangerous dotfile write protection (Linux)
+ *   Phase 10 — Dangerous dotfile write protection
  *   Phase 11 — seccomp syscall filtering (Linux)
  *   Phase 12 — Symlink TOCTOU attacks in sandbox mode (Linux)
  */
@@ -498,7 +498,11 @@ describe('Phase 10 — dangerous dotfile write protection', () => {
     '.bash_profile',
     '.profile',
     '.zshrc',
+    '.zprofile',
     '.gitconfig',
+    '.gitmodules',
+    '.ripgreprc',
+    '.mcp.json',
     '.npmrc',
   ];
 
@@ -533,7 +537,7 @@ describe('Phase 10 — dangerous dotfile write protection', () => {
   }
 
   test('cannot write to .git/hooks/ even with wr:$HOME bind',
-    { skip: !IS_LINUX },
+    { skip: !(IS_LINUX || IS_MACOS) },
     () => {
     const fakeHome = fs.mkdtempSync(path.join(TEMPDIR, 'boxsh-home-'));
     const repoDir = path.join(fakeHome, 'repo');
@@ -562,8 +566,43 @@ describe('Phase 10 — dangerous dotfile write protection', () => {
     }
   });
 
+  test('cannot create missing .git/hooks/ inside existing repo with wr:$HOME bind',
+    { skip: !(IS_LINUX || IS_MACOS) },
+    () => {
+    const fakeHome = fs.mkdtempSync(path.join(TEMPDIR, 'boxsh-home-'));
+    const repoDir = path.join(fakeHome, 'repo');
+    const hooksDir = path.join(repoDir, '.git', 'hooks');
+    const hookPath = path.join(hooksDir, 'pre-commit');
+    try {
+      const init = spawnSync('git', ['init', repoDir], { encoding: 'utf8' });
+      assert.equal(init.status, 0, `git init failed: ${init.stderr}`);
+      fs.rmSync(hooksDir, { recursive: true, force: true });
+
+      const marker = `BOXSH_HOOK_CREATE_${Date.now()}`;
+      const r = runSandboxWithHome(fakeHome,
+        `mkdir -p ${hooksDir} && ` +
+        `echo '#!/bin/sh\necho ${marker}' > ${hookPath} 2>&1; echo STATUS=$?`,
+      );
+      assert.equal(r.status, 0, `boxsh crashed: ${r.stderr}`);
+
+      assert.ok(
+        r.stdout.includes('Read-only') || r.stdout.includes('Permission denied') ||
+        r.stdout.includes('Operation not permitted') || r.stdout.includes('STATUS=1') ||
+        r.stdout.includes('STATUS=2'),
+        `SECURITY BUG: sandbox recreated .git/hooks/ inside repo!\n${r.stdout}`,
+      );
+
+      assert.ok(
+        !fs.existsSync(hookPath),
+        'SECURITY BUG: marker written to recreated host .git/hooks/pre-commit!',
+      );
+    } finally {
+      fs.rmSync(fakeHome, { recursive: true, force: true });
+    }
+  });
+
   test('cannot write to ~/.ssh/authorized_keys even with wr:$HOME bind',
-    { skip: !IS_LINUX },
+    { skip: !(IS_LINUX || IS_MACOS) },
     () => {
     const fakeHome = fs.mkdtempSync(path.join(TEMPDIR, 'boxsh-home-'));
     const sshDir = path.join(fakeHome, '.ssh');
@@ -587,6 +626,34 @@ describe('Phase 10 — dangerous dotfile write protection', () => {
       const content = fs.readFileSync(authKeys, 'utf8');
       assert.ok(!content.includes(marker),
         'SECURITY BUG: marker written to real host ~/.ssh/authorized_keys!');
+    } finally {
+      fs.rmSync(fakeHome, { recursive: true, force: true });
+    }
+  });
+
+  test('cannot create ~/.ssh/authorized_keys when .ssh is missing',
+    { skip: !(IS_LINUX || IS_MACOS) },
+    () => {
+    const fakeHome = fs.mkdtempSync(path.join(TEMPDIR, 'boxsh-home-'));
+    const sshDir = path.join(fakeHome, '.ssh');
+    const authKeys = path.join(sshDir, 'authorized_keys');
+    try {
+      const marker = `BOXSH_AUTHKEY_CREATE_${Date.now()}`;
+      const r = runSandboxWithHome(fakeHome,
+        `mkdir -p ~/.ssh && echo ${marker} > ~/.ssh/authorized_keys 2>&1; echo STATUS=$?`);
+      assert.equal(r.status, 0, `boxsh crashed: ${r.stderr}`);
+
+      assert.ok(
+        r.stdout.includes('Read-only') || r.stdout.includes('Permission denied') ||
+        r.stdout.includes('Operation not permitted') || r.stdout.includes('STATUS=1') ||
+        r.stdout.includes('STATUS=2'),
+        `SECURITY BUG: sandbox created ~/.ssh/authorized_keys!\n${r.stdout}`,
+      );
+
+      assert.ok(
+        !fs.existsSync(authKeys),
+        'SECURITY BUG: host ~/.ssh/authorized_keys was created by sandbox!',
+      );
     } finally {
       fs.rmSync(fakeHome, { recursive: true, force: true });
     }
