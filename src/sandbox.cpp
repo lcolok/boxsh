@@ -234,59 +234,6 @@ static bool protect_path_deny_write(const std::string &host_path,
                                          err);
 }
 
-static bool protect_git_hook_paths(const std::string &home,
-                                   const std::string &new_root,
-                                   const std::string &empty_dir,
-                                   const std::string &empty_file,
-                                   int cleanup_fd,
-                                   std::string &err) {
-    std::vector<std::string> stack;
-    stack.push_back(home);
-
-    while (!stack.empty()) {
-        std::string dir = stack.back();
-        stack.pop_back();
-
-        DIR *d = opendir(dir.c_str());
-        if (!d) continue;
-
-        struct dirent *ent;
-        while ((ent = readdir(d)) != nullptr) {
-            if (std::strcmp(ent->d_name, ".") == 0 ||
-                std::strcmp(ent->d_name, "..") == 0) {
-                continue;
-            }
-
-            std::string child = dir + "/" + ent->d_name;
-            struct stat st;
-            if (lstat(child.c_str(), &st) != 0 || !S_ISDIR(st.st_mode)) {
-                continue;
-            }
-
-            if (std::strcmp(ent->d_name, ".git") == 0) {
-                std::string hooks = child + "/hooks";
-                if (!protect_path_deny_write(hooks,
-                                             new_root,
-                                             ProtectedPathKind::Directory,
-                                             empty_dir,
-                                             empty_file,
-                                             cleanup_fd,
-                                             err)) {
-                    closedir(d);
-                    return false;
-                }
-                continue;
-            }
-
-            stack.push_back(child);
-        }
-
-        closedir(d);
-    }
-
-    return true;
-}
-
 static bool path_intersects(const std::string &path,
                             const std::string &other) {
     auto is_under = [](const std::string &candidate,
@@ -299,6 +246,14 @@ static bool path_intersects(const std::string &path,
     return is_under(path, other) || is_under(other, path);
 }
 
+static bool path_is_under(const std::string &path,
+                          const std::string &prefix) {
+    return path == prefix ||
+           (path.size() > prefix.size() &&
+            path[prefix.size()] == '/' &&
+            path.compare(0, prefix.size(), prefix) == 0);
+}
+
 static bool path_writable_via_bind(const SandboxConfig &cfg,
                                    const std::string &path) {
     for (const auto &bm : cfg.bind_mounts) {
@@ -306,6 +261,120 @@ static bool path_writable_via_bind(const SandboxConfig &cfg,
         if (path_intersects(path, bm.dst)) return true;
     }
     return false;
+}
+
+static bool protect_git_hook_dir(const std::string &repo_root,
+                                 const std::string &new_root,
+                                 const std::string &empty_dir,
+                                 const std::string &empty_file,
+                                 int cleanup_fd,
+                                 std::string &err) {
+    std::string git_dir = repo_root + "/.git";
+    struct stat st;
+    if (lstat(git_dir.c_str(), &st) != 0 || !S_ISDIR(st.st_mode)) {
+        return true;
+    }
+
+    std::string hooks = git_dir + "/hooks";
+    return protect_path_deny_write(hooks,
+                                   new_root,
+                                   ProtectedPathKind::Directory,
+                                   empty_dir,
+                                   empty_file,
+                                   cleanup_fd,
+                                   err);
+}
+
+static bool protect_git_hook_paths(const SandboxConfig &cfg,
+                                   const std::string &home,
+                                   const std::string &saved_cwd,
+                                   const std::string &new_root,
+                                   const std::string &empty_dir,
+                                   const std::string &empty_file,
+                                   int cleanup_fd,
+                                   std::string &err) {
+    struct ScanEntry {
+        std::string dir;
+        int depth;
+    };
+
+    std::set<std::string> scan_roots;
+    std::set<std::string> visited;
+    std::set<std::string> protected_repos;
+    std::vector<ScanEntry> stack;
+
+    if (path_is_under(saved_cwd, home) && path_writable_via_bind(cfg, saved_cwd)) {
+        scan_roots.insert(saved_cwd);
+    }
+
+    for (const auto &bm : cfg.bind_mounts) {
+        if (bm.mode != BindMount::Mode::RW) continue;
+        if (!path_is_under(bm.dst, home)) continue;
+        scan_roots.insert(bm.dst);
+    }
+
+    for (const auto &root : scan_roots) {
+        std::string current = root;
+        while (path_is_under(current, home)) {
+            if (protected_repos.insert(current).second &&
+                !protect_git_hook_dir(current,
+                                      new_root,
+                                      empty_dir,
+                                      empty_file,
+                                      cleanup_fd,
+                                      err)) {
+                return false;
+            }
+            if (current == home) break;
+            current = path_parent(current);
+        }
+
+        stack.push_back({root, 0});
+    }
+
+    while (!stack.empty()) {
+        ScanEntry entry = stack.back();
+        stack.pop_back();
+
+        if (!visited.insert(entry.dir).second) continue;
+        if (protected_repos.insert(entry.dir).second &&
+            !protect_git_hook_dir(entry.dir,
+                                  new_root,
+                                  empty_dir,
+                                  empty_file,
+                                  cleanup_fd,
+                                  err)) {
+            return false;
+        }
+        if (entry.depth >= 2) continue;
+
+        DIR *d = opendir(entry.dir.c_str());
+        if (!d) continue;
+
+        struct dirent *ent;
+        while ((ent = readdir(d)) != nullptr) {
+            if (std::strcmp(ent->d_name, ".") == 0 ||
+                std::strcmp(ent->d_name, "..") == 0) {
+                continue;
+            }
+            if (ent->d_name[0] == '.' && std::strcmp(ent->d_name, ".git") != 0) {
+                continue;
+            }
+
+            std::string child = entry.dir + "/" + ent->d_name;
+            struct stat st;
+            if (lstat(child.c_str(), &st) != 0 || !S_ISDIR(st.st_mode)) {
+                continue;
+            }
+            if (!path_is_under(child, home)) continue;
+
+            stack.push_back({child, entry.depth + 1});
+        }
+
+        closedir(d);
+    }
+
+    return true;
 }
 
 static std::vector<std::string> read_cleanup_paths(int fd) {
@@ -895,7 +964,9 @@ SandboxResult sandbox_apply(const SandboxConfig &cfg) {
                 }
 
                 if (path_writable_via_bind(cfg, home) &&
-                    !protect_git_hook_paths(home,
+                    !protect_git_hook_paths(cfg,
+                                            home,
+                                            saved_cwd,
                                             new_root,
                                             empty_dir,
                                             empty_file,

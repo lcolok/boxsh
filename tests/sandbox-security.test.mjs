@@ -47,6 +47,28 @@ function runSandboxWithHome(homeDir, cmd, timeout_ms = 8000) {
   });
 }
 
+function runSandboxWithWritableBind(bindPath, homeDir, cmd, timeout_ms = 8000) {
+  return spawnSync(BOXSH, [
+    '--sandbox', '--bind', `wr:${bindPath}`, '-c', cmd,
+  ], {
+    encoding: 'utf8',
+    cwd: homeDir,
+    timeout: timeout_ms,
+    env: { ...process.env, HOME: homeDir },
+  });
+}
+
+function runSandboxWithWritableBindAndCwd(bindPath, cwd, homeDir, cmd, timeout_ms = 8000) {
+  return spawnSync(BOXSH, [
+    '--sandbox', '--bind', `wr:${bindPath}`, '-c', cmd,
+  ], {
+    encoding: 'utf8',
+    cwd,
+    timeout: timeout_ms,
+    env: { ...process.env, HOME: homeDir },
+  });
+}
+
 // ============================================================================
 // Phase 1 — Symlink-based escape attempts
 // ============================================================================
@@ -563,6 +585,134 @@ describe('Phase 10 — dangerous dotfile write protection', () => {
       );
     } finally {
       fs.rmSync(fakeHome, { recursive: true, force: true });
+    }
+  });
+
+  test('cannot write to ~/.bashrc when only HOME parent is bound writable',
+    { skip: !(IS_LINUX || IS_MACOS) },
+    () => {
+    const fakeHome = fs.mkdtempSync(path.join(TEMPDIR, 'boxsh-home-parent-'));
+    const homeParent = path.dirname(fakeHome);
+    const marker = `BOXSH_PARENT_HOME_${Date.now()}`;
+    try {
+      const r = runSandboxWithWritableBind(homeParent,
+        fakeHome,
+        `echo ${marker} >> ~/.bashrc 2>&1; echo STATUS=$?`);
+      assert.equal(r.status, 0, `boxsh crashed: ${r.stderr}`);
+
+      assert.ok(
+        r.stdout.includes('Read-only') || r.stdout.includes('Permission denied') ||
+        r.stdout.includes('Operation not permitted') || r.stdout.includes('STATUS=1') ||
+        r.stdout.includes('STATUS=2'),
+        `SECURITY BUG: sandbox allowed write to ~/.bashrc via writable HOME parent!\n${r.stdout}`,
+      );
+
+      const bashrcPath = path.join(fakeHome, '.bashrc');
+      if (fs.existsSync(bashrcPath)) {
+        const content = fs.readFileSync(bashrcPath, 'utf8');
+        assert.ok(!content.includes(marker),
+          'SECURITY BUG: marker written to real host ~/.bashrc via writable HOME parent!');
+      }
+    } finally {
+      fs.rmSync(fakeHome, { recursive: true, force: true });
+    }
+  });
+
+  test('cannot write to .git/hooks/ when only HOME parent is bound writable',
+    { skip: !(IS_LINUX || IS_MACOS) },
+    () => {
+    const fakeHome = fs.mkdtempSync(path.join(TEMPDIR, 'boxsh-home-parent-'));
+    const homeParent = path.dirname(fakeHome);
+    const repoDir = path.join(fakeHome, 'repo');
+    try {
+      const init = spawnSync('git', ['init', repoDir], { encoding: 'utf8' });
+      assert.equal(init.status, 0, `git init failed: ${init.stderr}`);
+
+      const marker = `BOXSH_PARENT_HOOK_${Date.now()}`;
+      const hookPath = path.join(repoDir, '.git/hooks/pre-commit');
+      const r = runSandboxWithWritableBind(homeParent,
+        fakeHome,
+        `echo '#!/bin/sh\necho ${marker}' > ${hookPath} 2>&1; echo STATUS=$?`);
+      assert.equal(r.status, 0, `boxsh crashed: ${r.stderr}`);
+
+      assert.ok(
+        r.stdout.includes('Read-only') || r.stdout.includes('Permission denied') ||
+        r.stdout.includes('Operation not permitted') || r.stdout.includes('STATUS=1') ||
+        r.stdout.includes('STATUS=2'),
+        `SECURITY BUG: sandbox allowed write to .git/hooks/ via writable HOME parent!\n${r.stdout}`,
+      );
+
+      assert.ok(
+        !fs.existsSync(hookPath) || !fs.readFileSync(hookPath, 'utf8').includes(marker),
+        'SECURITY BUG: marker written to real host .git/hooks/pre-commit via writable HOME parent!',
+      );
+    } finally {
+      fs.rmSync(fakeHome, { recursive: true, force: true });
+    }
+  });
+
+  test('does not expose ~/.bashrc when HOME is not bound',
+    { skip: !(IS_LINUX || IS_MACOS) },
+    () => {
+    const fakeHome = fs.mkdtempSync(path.join(TEMPDIR, 'boxsh-home-hidden-'));
+    const stageDir = fs.mkdtempSync(path.join(TEMPDIR, 'boxsh-stage-'));
+    const bashrcPath = path.join(fakeHome, '.bashrc');
+    const marker = `BOXSH_HIDDEN_BASHRC_${Date.now()}`;
+    try {
+      fs.writeFileSync(bashrcPath, `${marker}\n`);
+
+      const r = runSandboxWithWritableBindAndCwd(stageDir,
+        stageDir,
+        fakeHome,
+        `test ! -e ~/.bashrc && echo BASHRC_HIDDEN; ` +
+        `cat ~/.bashrc 2>&1 || true`);
+      assert.equal(r.status, 0, `boxsh crashed: ${r.stderr}`);
+
+      assert.ok(
+        r.stdout.includes('BASHRC_HIDDEN'),
+        `SECURITY BUG: ~/.bashrc unexpectedly visible without HOME bind!\n${r.stdout}`,
+      );
+      assert.ok(
+        !r.stdout.includes(marker),
+        `SECURITY BUG: ~/.bashrc content leaked into sandbox without HOME bind!\n${r.stdout}`,
+      );
+    } finally {
+      fs.rmSync(fakeHome, { recursive: true, force: true });
+      fs.rmSync(stageDir, { recursive: true, force: true });
+    }
+  });
+
+  test('does not expose HOME git hooks when HOME is not bound',
+    { skip: !(IS_LINUX || IS_MACOS) },
+    () => {
+    const fakeHome = fs.mkdtempSync(path.join(TEMPDIR, 'boxsh-home-hidden-'));
+    const stageDir = fs.mkdtempSync(path.join(TEMPDIR, 'boxsh-stage-'));
+    const repoDir = path.join(fakeHome, 'repo');
+    const hookPath = path.join(repoDir, '.git/hooks/pre-commit');
+    const marker = `BOXSH_HIDDEN_HOOK_${Date.now()}`;
+    try {
+      const init = spawnSync('git', ['init', repoDir], { encoding: 'utf8' });
+      assert.equal(init.status, 0, `git init failed: ${init.stderr}`);
+      fs.writeFileSync(hookPath, `#!/bin/sh\necho ${marker}\n`);
+
+      const r = runSandboxWithWritableBindAndCwd(stageDir,
+        stageDir,
+        fakeHome,
+        `test ! -e ~/repo/.git/hooks/pre-commit && echo HOOK_HIDDEN; ` +
+        `cat ~/repo/.git/hooks/pre-commit 2>&1 || true`);
+      assert.equal(r.status, 0, `boxsh crashed: ${r.stderr}`);
+
+      assert.ok(
+        r.stdout.includes('HOOK_HIDDEN'),
+        `SECURITY BUG: HOME git hook unexpectedly visible without HOME bind!\n${r.stdout}`,
+      );
+      assert.ok(
+        !r.stdout.includes(marker),
+        `SECURITY BUG: HOME git hook content leaked into sandbox without HOME bind!\n${r.stdout}`,
+      );
+    } finally {
+      fs.rmSync(fakeHome, { recursive: true, force: true });
+      fs.rmSync(stageDir, { recursive: true, force: true });
     }
   });
 
